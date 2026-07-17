@@ -651,7 +651,42 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
         toastr.remove()
         toastr.info('<?php echo $lang->get('searching'); ?>')
 
-        $('#jstree').one('refresh.jstree', function() {
+        // Clear any stale error messages from previous searches
+        $('#jstree').empty()
+
+        // Attempt tree refresh
+        try {
+            const jstreeInstance = $('#jstree').jstree(true)
+            if (jstreeInstance) {
+                // Set up one-time listener for refresh completion
+                $('#jstree').one('refresh.jstree', function() {
+                    refreshTree('', false, true)
+                    $('#jstree').jstree('open_all')
+                    adjustItemsLayoutHeights()
+
+                    store.update('teampassApplication', function(teampassApplication) {
+                        teampassApplication.jstreeForceRefresh = 0
+                    })
+
+                    toastr.remove()
+                })
+                // Trigger the refresh (will fire the one() listener above when complete)
+                jstreeInstance.refresh(true)
+            } else {
+                // Tree not initialized; directly execute search completion logic
+                refreshTree('', false, true)
+                $('#jstree').jstree('open_all')
+                adjustItemsLayoutHeights()
+
+                store.update('teampassApplication', function(teampassApplication) {
+                    teampassApplication.jstreeForceRefresh = 0
+                })
+
+                toastr.remove()
+            }
+        } catch (e) {
+            if (debugJavascript === true) console.error('jstree refresh failed during folder search:', e)
+            // Fallback: directly execute search completion logic
             refreshTree('', false, true)
             $('#jstree').jstree('open_all')
             adjustItemsLayoutHeights()
@@ -661,22 +696,6 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
             })
 
             toastr.remove()
-        })
-
-        // Attempt tree refresh; if it fails, manually trigger the refresh event
-        // so the one() listener above still executes and search can proceed
-        try {
-            const jstreeInstance = $('#jstree').jstree(true)
-            if (jstreeInstance) {
-                jstreeInstance.refresh(true)
-            } else {
-                // Tree not initialized; fire the event manually
-                $('#jstree').trigger('refresh.jstree')
-            }
-        } catch (e) {
-            if (debugJavascript === true) console.error('jstree refresh failed during folder search:', e)
-            // Still fire the event so search flow continues
-            $('#jstree').trigger('refresh.jstree')
         }
     })
 
