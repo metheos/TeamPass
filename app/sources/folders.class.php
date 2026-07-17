@@ -1,0 +1,801 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Teampass - a collaborative passwords manager.
+ * ---
+ * This file is part of the TeamPass project.
+ * 
+ * TeamPass is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3 of the License.
+ * 
+ * TeamPass is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * 
+ * Certain components of this file may be under different licenses. For
+ * details, see the `licenses` directory or individual file headers.
+ * ---
+ * @file      folders.class.php
+ * @author    Nils Laumaillé (nils@teampass.net)
+ * @copyright 2009-2026 Teampass.net
+ * @license   GPL-3.0
+ * @see       https://www.teampass.net
+ */
+
+use TeampassClasses\NestedTree\NestedTree;
+use TeampassClasses\SessionManager\SessionManager;
+use TeampassClasses\ConfigManager\ConfigManager;
+
+class FolderManager
+{
+    private $lang;
+    private $settings;
+
+    /**
+     * Constructor
+     */
+    public function __construct($lang)
+    {
+        $this->lang = $lang;
+        $this->loadSettings();
+    }
+
+    /**
+     * Load settings
+     */
+    private function loadSettings()
+    {
+        // Load config if $SETTINGS not defined
+        $configManager = new ConfigManager();
+        $this->settings = $configManager->getAllSettings();
+    }
+
+    /**
+     * Create a new folder
+     *
+     * @param array $params
+     * @return array
+     */
+    public function createNewFolder(array $params, array $options = []): array
+    {
+            // Decompose parameters
+            $title = $params['title'] ?? '';
+            $parent_id = $params['parent_id'] ?? 0;
+            $personal_folder = $params['personal_folder'] ?? 0;
+            $complexity = $params['complexity'] ?? 0;
+            $user_is_admin = $params['user_is_admin'] ?? 0;
+            $user_accessible_folders = $params['user_accessible_folders'] ?? [];
+            $user_can_create_root_folder = $params['user_can_create_root_folder'] ?? 0;
+
+
+        if ($this->isTitleNumeric($title)) {
+            return $this->errorResponse($this->lang->get('error_only_numbers_in_folder_name'));
+        }
+
+        if (!$this->isParentFolderAllowed($parent_id, $user_accessible_folders, $user_is_admin, $user_can_create_root_folder)) {
+            return $this->errorResponse($this->lang->get('error_folder_not_allowed_for_this_user'));
+        }
+
+        if (!$this->checkDuplicateFolderAllowed($title) && $personal_folder == 0) {
+            return $this->errorResponse($this->lang->get('error_group_exist'));
+        }
+
+        $parentFolderData = $this->getParentFolderData($parent_id);
+
+        $parentComplexity = $this->checkComplexityLevel($parentFolderData, $complexity, $parent_id);
+        if (isset($parentComplexity['error']) && $parentComplexity['error'] === true) {
+            // Build the required-level label from the TP_PW_COMPLEXITY constant
+            // (not a DB setting); fall back to the raw value if not defined (API context)
+            $requiredLevel = (int) ($parentComplexity['valeur'] ?? 0);
+            $requiredLabel = defined('TP_PW_COMPLEXITY') === true && isset(TP_PW_COMPLEXITY[$requiredLevel][1])
+                ? TP_PW_COMPLEXITY[$requiredLevel][1]
+                : (string) $requiredLevel;
+            return $this->errorResponse($this->lang->get('error_folder_complexity_lower_than_top_folder') . " [<b>{$requiredLabel}</b>]");
+        }
+
+        return $this->createFolder($params, array_merge($parentFolderData, $parentComplexity), $options);
+    }
+
+    /**
+     * Update an existing folder.
+     *
+     * Write engine shared by the API (access checks and business validation are
+     * performed by the caller — FolderModel/FolderController). Only the columns
+     * explicitly present in $params are written (partial update). $params keys:
+     *  - id (int, required)
+     *  - personal_folder (int, derived from the resolved parent — always written)
+     *  - parent_id, title, duration, create_auth_without, edit_auth_without,
+     *    icon, icon_selected, complexity (all optional — only written when present)
+     *  - parent_changed (bool), user_login, user_roles (context, never from session)
+     *
+     * @param array $params  Folder update parameters (see above)
+     * @param array $options Reserved for future toggles (unused today)
+     * @return array{error: bool, id?: int, title?: string, parent_id?: int, message?: string}
+     */
+    public function updateFolder(array $params, array $options = []): array
+    {
+        $folderId = (int) ($params['id'] ?? 0);
+        if ($folderId <= 0) {
+            return ['error' => true, 'message' => 'Invalid folder id'];
+        }
+
+        $current = DB::queryFirstRow(
+            'SELECT * FROM ' . prefixTable('nested_tree') . ' WHERE id = %i',
+            $folderId
+        );
+        if ($current === null) {
+            return ['error' => true, 'message' => 'Folder not found'];
+        }
+
+        // Build the set of columns to update — only the keys present in the request
+        $folderParameters = [
+            'personal_folder' => (int) ($params['personal_folder'] ?? $current['personal_folder']),
+        ];
+        if (array_key_exists('parent_id', $params)) {
+            $folderParameters['parent_id'] = (int) $params['parent_id'];
+        }
+        if (array_key_exists('title', $params)) {
+            $folderParameters['title'] = (string) $params['title'];
+        }
+        if (array_key_exists('duration', $params)) {
+            $folderParameters['renewal_period'] = (int) $params['duration'];
+        }
+        if (array_key_exists('create_auth_without', $params)) {
+            $folderParameters['bloquer_creation'] = (int) $params['create_auth_without'];
+        }
+        if (array_key_exists('edit_auth_without', $params)) {
+            $folderParameters['bloquer_modification'] = (int) $params['edit_auth_without'];
+        }
+        if (array_key_exists('icon', $params)) {
+            $folderParameters['fa_icon'] = empty($params['icon']) === true ? TP_DEFAULT_ICON : (string) $params['icon'];
+        }
+        if (array_key_exists('icon_selected', $params)) {
+            $folderParameters['fa_icon_selected'] = empty($params['icon_selected']) === true ? TP_DEFAULT_ICON_SELECTED : (string) $params['icon_selected'];
+        }
+
+        DB::update(
+            prefixTable('nested_tree'),
+            $folderParameters,
+            'id = %i',
+            $folderId
+        );
+
+        // Complexity upsert (only when provided) — reuse the INSERT...ON DUPLICATE
+        // KEY UPDATE helper so a personal folder without a misc/complex row is handled.
+        if (array_key_exists('complexity', $params) && $params['complexity'] !== null) {
+            $this->addComplexity((string) $folderId, (int) $params['complexity']);
+        }
+
+        // Ensure categories are set for this folder
+        handleFoldersCategories([$folderId]);
+
+        // Rebuild the nested tree — never touch nleft/nright/nlevel manually
+        $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+        $tree->rebuild();
+
+        // Invalidate cache for users with access to this folder
+        invalidateCacheForFolderUsers($folderId);
+        if (!empty($params['parent_changed'])) {
+            $this->refreshCacheForUsersWithSimilarRoles((string) ($params['user_roles'] ?? ''));
+        }
+
+        $newTitle = $folderParameters['title'] ?? (string) $current['title'];
+        $newParentId = isset($folderParameters['parent_id'])
+            ? (int) $folderParameters['parent_id']
+            : (int) $current['parent_id'];
+
+        // Emit WebSocket event — excludeUserId = null (the API caller's UI did not
+        // perform the change locally, so nobody is excluded)
+        emitFolderEvent(
+            'updated',
+            $folderId,
+            (string) $newTitle,
+            (string) ($params['user_login'] ?? ''),
+            $newParentId,
+            null
+        );
+
+        return [
+            'error' => false,
+            'id' => $folderId,
+            'title' => (string) $newTitle,
+            'parent_id' => $newParentId,
+        ];
+    }
+
+    /**
+     * Soft-delete folders and their descendants (recycle-bin format).
+     *
+     * Mirrors the web delete_folders handler: every node goes to the recycle bin
+     * (a misc 'folder_deleted' JSON row) and its items are soft-deleted; the
+     * nested_tree rows are then removed (restorable from Utilities → Recycled bin).
+     * No session bookkeeping — user context comes from $context.
+     *
+     * @param array<int> $folderIds Folder IDs to delete (descendants included automatically)
+     * @param array      $context   user_id (int), user_login (string), SETTINGS (array)
+     * @return array{error: bool, deleted_folders?: array<int>, deleted_items_count?: int, message?: string}
+     */
+    public function deleteFolders(array $folderIds, array $context): array
+    {
+        $userId = (int) ($context['user_id'] ?? 0);
+        $userLogin = (string) ($context['user_login'] ?? '');
+        $SETTINGS = is_array($context['SETTINGS'] ?? null) ? $context['SETTINGS'] : $this->settings;
+
+        $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+
+        $folderForDel = [];
+        $foldersDeletedInfo = [];
+        $deletedItemsCount = 0;
+
+        DB::startTransaction();
+        try {
+            foreach ($folderIds as $requestedFolderId) {
+                $requestedFolderId = (int) $requestedFolderId;
+                if (in_array($requestedFolderId, $folderForDel, true) === true) {
+                    continue;
+                }
+
+                $subFolders = $tree->getDescendants($requestedFolderId, true);
+                foreach ($subFolders as $thisSubFolders) {
+                    // Never delete a personal root folder (defense in depth)
+                    if ((int) $thisSubFolders->parent_id === 0
+                        && (int) ($thisSubFolders->personal_folder ?? 0) === 1
+                    ) {
+                        continue;
+                    }
+                    if ((int) $thisSubFolders->parent_id < 0) {
+                        continue;
+                    }
+
+                    // Store the deleted folder (recycled bin) as JSON — this format
+                    // is parsed by utilities.queries.php on restore; any drift breaks it.
+                    $folderDeletedData = [
+                        'id' => (int) $thisSubFolders->id,
+                        'parent_id' => (int) $thisSubFolders->parent_id,
+                        'title' => (string) $thisSubFolders->title,
+                        'nleft' => (int) $thisSubFolders->nleft,
+                        'nright' => (int) $thisSubFolders->nright,
+                        'nlevel' => (int) $thisSubFolders->nlevel,
+                        'bloquer_creation' => (int) ($thisSubFolders->bloquer_creation ?? 0),
+                        'bloquer_modification' => (int) ($thisSubFolders->bloquer_modification ?? 0),
+                        'personal_folder' => (int) ($thisSubFolders->personal_folder ?? 0),
+                        'renewal_period' => (int) ($thisSubFolders->renewal_period ?? 0),
+                        'categories' => (string) ($thisSubFolders->categories ?? ''),
+                        'deleted_by' => $userId,
+                        'deleted_by_login' => $userLogin,
+                    ];
+                    if (isset($thisSubFolders->fa_icon) === true) {
+                        $folderDeletedData['fa_icon'] = (string) $thisSubFolders->fa_icon;
+                    }
+                    if (isset($thisSubFolders->fa_icon_selected) === true) {
+                        $folderDeletedData['fa_icon_selected'] = (string) $thisSubFolders->fa_icon_selected;
+                    }
+                    if (isset($thisSubFolders->is_template) === true) {
+                        $folderDeletedData['is_template'] = (int) $thisSubFolders->is_template;
+                    }
+
+                    DB::query(
+                        'INSERT INTO %l (type, intitule, valeur, created_at)
+                         VALUES (%s, %s, %s, %i)
+                         ON DUPLICATE KEY UPDATE valeur = VALUES(valeur), updated_at = %i',
+                        prefixTable('misc'),
+                        'folder_deleted',
+                        'f' . (int) $thisSubFolders->id,
+                        json_encode($folderDeletedData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                        time(),
+                        time()
+                    );
+
+                    $folderForDel[] = (int) $thisSubFolders->id;
+                    $foldersDeletedInfo[] = [
+                        'folder_id' => (int) $thisSubFolders->id,
+                        'title' => (string) $thisSubFolders->title,
+                        'parent_id' => (int) $thisSubFolders->parent_id,
+                    ];
+
+                    // Soft-delete items in this folder
+                    $itemsInSubFolder = DB::query(
+                        'SELECT id, label FROM ' . prefixTable('items') . ' WHERE id_tree = %i',
+                        $thisSubFolders->id
+                    );
+                    foreach ($itemsInSubFolder as $item) {
+                        DB::update(
+                            prefixTable('items'),
+                            [
+                                'inactif' => '1',
+                                'deleted_at' => time(),
+                            ],
+                            'id = %i',
+                            $item['id']
+                        );
+
+                        logItems(
+                            $SETTINGS,
+                            (int) $item['id'],
+                            (string) $item['label'],
+                            $userId,
+                            'at_delete',
+                            $userLogin
+                        );
+
+                        updateCacheTable('delete_value', (int) $item['id']);
+                        $deletedItemsCount++;
+                    }
+                }
+            }
+
+            // Collect affected users BEFORE deleting folders/roles
+            $folderForDel = array_values(array_unique($folderForDel));
+            $affectedUserIds = [];
+            if (empty($folderForDel) === false) {
+                $affectedUserIds = DB::queryFirstColumn(
+                    'SELECT DISTINCT ur.user_id FROM ' . prefixTable('users_roles') . ' ur
+                    JOIN ' . prefixTable('roles_values') . ' rv ON ur.role_id = rv.role_id
+                    WHERE rv.folder_id IN %ls',
+                    $folderForDel
+                );
+            }
+
+            foreach ($folderForDel as $fol) {
+                DB::delete(prefixTable('nested_tree'), 'id = %i', $fol);
+            }
+
+            invalidateCacheForFolderUsers(0, $affectedUserIds);
+
+            DB::commit();
+        } catch (Throwable $e) {
+            DB::rollback();
+            return ['error' => true, 'message' => $e->getMessage()];
+        }
+
+        // Rebuild the tree after commit (mirrors the web handler)
+        $tree->rebuild();
+
+        // Emit WebSocket events for deleted folders
+        foreach ($foldersDeletedInfo as $deletedFolder) {
+            emitFolderEvent(
+                'deleted',
+                (int) $deletedFolder['folder_id'],
+                (string) $deletedFolder['title'],
+                $userLogin,
+                (int) $deletedFolder['parent_id'],
+                null
+            );
+        }
+
+        return [
+            'error' => false,
+            'deleted_folders' => $folderForDel,
+            'deleted_items_count' => $deletedItemsCount,
+        ];
+    }
+
+    /**
+     * Check if title is numeric
+     *
+     * @param string $title
+     * @return boolean
+     */
+    private function isTitleNumeric($title)
+    {
+        return is_numeric($title);
+    }
+
+    /**
+     * Check if parent folder is allowed
+     *
+     * @param integer $parent_id
+     * @param array $user_accessible_folders
+     * @param boolean $user_is_admin
+     * @param boolean $user_can_create_root_folder
+     * @return boolean
+     */
+    private function isParentFolderAllowed($parent_id, $user_accessible_folders, $user_is_admin, $user_can_create_root_folder)
+    {
+        if ($parent_id == 0 && $user_can_create_root_folder == true)
+	    return true;
+
+        if (in_array($parent_id, $user_accessible_folders) === false
+            && (int) $user_is_admin !== 1
+        ) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Check if duplicate folder is allowed
+     *
+     * @param string $title
+     * @return boolean
+     */
+    private function checkDuplicateFolderAllowed($title)
+    {
+        if (
+            isset($this->settings['duplicate_folder']) === true
+            && (int) $this->settings['duplicate_folder'] === 0
+        ) {
+            DB::query(
+                'SELECT *
+                FROM ' . prefixTable('nested_tree') . '
+                WHERE title = %s AND personal_folder = 0',
+                $title
+            );
+            $counter = DB::count();
+            if ($counter !== 0) {
+                return false;
+            }
+            return true;
+        }
+        return true;
+    }
+
+    /**
+     * Get parent folder data
+     *
+     * @param integer $parent_id
+     * @return array
+     */
+    private function getParentFolderData($parent_id)
+    {
+        //check if parent folder is personal
+        $data = DB::queryFirstRow(
+            'SELECT personal_folder, bloquer_creation, bloquer_modification
+            FROM ' . prefixTable('nested_tree') . '
+            WHERE id = %i',
+            $parent_id
+        );
+
+        // inherit from parent the specific settings it has
+        if (DB::count() > 0) {
+            $parentBloquerCreation = $data['bloquer_creation'];
+            $parentBloquerModification = $data['bloquer_modification'];
+        } else {
+            $parentBloquerCreation = 0;
+            $parentBloquerModification = 0;
+        }
+
+        return [
+            'isPersonal' => null !== $data ? (int) $data['personal_folder'] : 0,
+            'parentBloquerCreation' => $parentBloquerCreation,
+            'parentBloquerModification' => $parentBloquerModification,
+        ];
+    }
+
+    /**
+     * Check complexity level
+     *
+     * @param array $data
+     * @param integer $complexity
+     * @param integer $parent_id
+     * @return array
+     */
+    private function checkComplexityLevel(
+        $data,
+        $complexity,
+        $parent_id
+    )
+    {
+        if ((int) $data['isPersonal'] === 0) {    
+            // get complexity level for this folder
+            $data = DB::queryFirstRow(
+                'SELECT valeur
+                FROM ' . prefixTable('misc') . '
+                WHERE intitule = %i AND type = %s',
+                $parent_id,
+                'complex'
+            );
+            if (isset($data['valeur']) === true && intval($complexity) < intval($data['valeur'])) {
+                return [
+                    'error' => true,
+                    // Required minimal level — used by the caller to build the error message
+                    'valeur' => (int) $data['valeur'],
+                ];
+            }
+        }
+
+        return [
+            'parent_complexity' => isset($data['valeur']) === true ? $data['valeur'] : 0,
+        ];
+    }
+
+    /**
+     * Creates a new folder in the system, applying necessary settings, permissions, 
+     * cache updates, and user role management.
+     *
+     * @param array $params - Parameters for folder creation (e.g., title, icon, etc.)
+     * @param array $parentFolderData - Parent folder data (e.g., ID, permissions)
+     * @return array - Returns an array indicating success or failure
+     */
+    private function createFolder($params, $parentFolderData, $options)
+    {
+        // Decompose parameters
+        $title = $params['title'] ?? '';
+        $parent_id = $params['parent_id'] ?? 0;
+        $isPersonal = $params['personal_folder'] ?? 0;
+        $complexity = $params['complexity'] ?? 0;
+        $access_rights = $params['access_rights'] ?? '';
+        $user_is_admin = $params['user_is_admin'] ?? 0;
+        $user_is_manager = $params['user_is_manager'] ?? 0;
+        $user_can_create_root_folder = $params['user_can_create_root_folder'] ?? 0;
+        $user_can_manage_all_users = $params['user_can_manage_all_users'] ?? 0;
+        $user_id = $params['user_id'] ?? 0;
+        $user_roles = $params['user_roles'] ?? '';    
+
+        if ($this->canCreateFolder($isPersonal, $user_is_admin, $user_is_manager, $user_can_manage_all_users, $user_can_create_root_folder)) {
+            $newId = $this->insertFolder($params, $parentFolderData);
+            $this->addComplexity($newId, $complexity);
+            if (isset($options['setFolderCategories']) && $options['setFolderCategories'] === true) {
+                $this->setFolderCategories($newId);
+            }
+            $this->updateTimestamp((int) $newId);
+            if (isset($options['rebuildFolderTree']) && $options['rebuildFolderTree'] === true) {
+                $this->rebuildFolderTree($user_is_admin, $title, $parent_id, $isPersonal, $user_id, $newId);
+            }
+            if (isset($options['manageFolderPermissions']) && $options['manageFolderPermissions'] === true) {
+                $this->manageFolderPermissions($parent_id, $newId, $user_roles, $access_rights, $user_is_admin);
+            }
+            if (isset($options['copyCustomFieldsCategories']) && $options['copyCustomFieldsCategories'] === true) {
+                $this->copyCustomFieldsCategories($parent_id, $newId);
+            }
+            if (isset($options['refreshCacheForUsersWithSimilarRoles']) && $options['refreshCacheForUsersWithSimilarRoles'] === true) {
+                $this->refreshCacheForUsersWithSimilarRoles($user_roles);
+            }
+
+            return ['error' => false, 'newId' => $newId];
+        } else {
+            return ['error' => true, 'newId' => null];
+        }
+    }
+
+    /**
+     * Checks if the user has the permissions to create a folder.
+     */
+    private function canCreateFolder($isPersonal, $user_is_admin, $user_is_manager, $user_can_manage_all_users, $user_can_create_root_folder)
+    {
+        return (int)$isPersonal === 1 ||
+            (int)$user_is_admin === 1 ||
+            ((int)$user_is_manager === 1 || (int)$user_can_manage_all_users === 1) ||
+            ($this->settings['enable_user_can_create_folders'] ?? false) ||
+            ((int)$user_can_create_root_folder === 1);
+    }
+
+    /**
+     * Inserts a new folder into the database and returns the new folder ID.
+     */
+    private function insertFolder($params, $parentFolderData)
+    {
+        DB::insert(prefixTable('nested_tree'), [
+            'parent_id' => $params['parent_id'],
+            'title' => $params['title'],
+            'personal_folder' => $params['personal_folder'] ?? 0,
+            'renewal_period' => $params['duration'] ?? 0,
+            'bloquer_creation' => $params['create_auth_without'] ?? $parentFolderData['parentBloquerCreation'],
+            'bloquer_modification' => $params['edit_auth_without'] ?? $parentFolderData['parentBloquerModification'],
+            'fa_icon' => empty($params['icon']) ? TP_DEFAULT_ICON : $params['icon'],
+            'fa_icon_selected' => empty($params['icon_selected']) ? TP_DEFAULT_ICON_SELECTED : $params['icon_selected'],
+            'categories' => '',
+        ]);
+
+        return DB::insertId();
+    }
+
+    /**
+     * Adds complexity settings for the newly created folder.
+     */
+    private function addComplexity($folderId, $complexity)
+    {
+        DB::query(
+            'INSERT INTO %l (type, intitule, valeur, created_at)
+             VALUES (%s, %s, %s, %i)
+             ON DUPLICATE KEY UPDATE valeur = VALUES(valeur), updated_at = %i',
+            prefixTable('misc'),
+            'complex',
+            (string) $folderId,
+            (string) $complexity,
+            time(),
+            time()
+        );
+    }
+
+    /**
+     * Ensures that folder categories are set.
+     */
+    private function setFolderCategories($folderId)
+    {
+        handleFoldersCategories([$folderId]);
+    }
+
+    /**
+     * Invalidate cache for users with access to the given folder.
+     */
+    private function updateTimestamp(int $folderId)
+    {
+        invalidateCacheForFolderUsers($folderId);
+    }
+
+    /**
+     * Rebuilds the folder tree and updates the cache for non-admin users.
+     */
+    private function rebuildFolderTree($user_is_admin, $title, $parent_id, $isPersonal, $user_id, $newId)
+    {
+        $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+        $tree->rebuild();
+
+        // Update session visible folders.
+        // Guarded: under the API SAPI there is no active session, and starting one
+        // here would be an unwanted side effect (session files created for a stateless
+        // request). The web path always has an active session.
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            $sess_key = $isPersonal ? 'user-personal_folders' : 'user-accessible_folders';
+            SessionManager::addRemoveFromSessionArray($sess_key, [$newId], 'add');
+        }
+
+        if ($user_is_admin === 0) {
+            $this->updateUserFolderCache($tree, $title, $parent_id, $isPersonal, $user_id, $newId);
+        }
+    }
+
+    /**
+     * Updates the user folder cache for non-admin users.
+     */
+    private function updateUserFolderCache($tree, $title, $parent_id, $isPersonal, $user_id, $newId)
+    {
+        $path = '';
+        $tree_path = $tree->getPath(0, false);
+        foreach ($tree_path as $fld) {
+            $path .= empty($path) ? $fld->title : '/' . $fld->title;
+        }
+
+        $new_json = [
+            "path" => $path,
+            "id" => $newId,
+            "level" => count($tree_path),
+            "title" => $title,
+            "disabled" => 0,
+            "parent_id" => $parent_id,
+            "perso" => $isPersonal,
+            "is_visible_active" => 0,
+        ];
+
+        $cache_tree = DB::queryFirstRow(
+            'SELECT increment_id, folders, visible_folders 
+            FROM ' . prefixTable('cache_tree') . ' 
+            WHERE user_id = %i', 
+            (int) $user_id
+        );
+
+        if (empty($cache_tree)) {
+            DB::insert(
+                prefixTable('cache_tree'), 
+                [
+                    'user_id' => $user_id,
+                    'folders' => json_encode([$newId]),
+                    'visible_folders' => json_encode($new_json),
+                    'timestamp' => time(),
+                    'data' => '[{}]',
+                ]
+            );
+        } else {
+            $folders = json_decode($cache_tree['folders'] ?? '[]', true);
+            $visible_folders = json_decode($cache_tree['visible_folders'] ?? '[]', true);
+            $folders[] = $newId;
+            $visible_folders[] = $new_json;
+
+            DB::update(
+                prefixTable('cache_tree'), 
+                [
+                    'folders' => json_encode($folders),
+                    'visible_folders' => json_encode($visible_folders),
+                    'timestamp' => time(),
+                ],
+                'increment_id = %i', 
+                (int) $cache_tree['increment_id']
+            );
+        }
+    }
+
+    /**
+     * Manages folder permissions based on user roles or parent folder settings.
+     */
+    private function manageFolderPermissions($parent_id, $newId, $user_roles, $access_rights, $user_is_admin)
+    {
+        if ($parent_id !== 0 && $this->settings['subfolder_rights_as_parent']) {
+            $rows = DB::query('SELECT role_id, type FROM ' . prefixTable('roles_values') . ' WHERE folder_id = %i', $parent_id);
+            foreach ($rows as $record) {
+                DB::insert(prefixTable('roles_values'), [
+                    'role_id' => $record['role_id'],
+                    'folder_id' => $newId,
+                    'type' => $record['type'],
+                ]);
+            }
+        } elseif ((int)$user_is_admin !== 1) {
+            foreach (array_unique(explode(';', $user_roles)) as $role) {
+                if (!empty($role)) {
+                    DB::insert(prefixTable('roles_values'), [
+                        'role_id' => $role,
+                        'folder_id' => $newId,
+                        'type' => $access_rights,
+                    ]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Copies custom field categories from the parent folder to the newly created folder.
+     */
+    private function copyCustomFieldsCategories($parent_id, $newId)
+    {
+        $rows = DB::query('SELECT id_category FROM ' . prefixTable('categories_folders') . ' WHERE id_folder = %i', $parent_id);
+        foreach ($rows as $record) {
+            DB::insert(prefixTable('categories_folders'), [
+                'id_category' => $record['id_category'],
+                'id_folder' => $newId,
+            ]);
+        }
+    }
+
+    /**
+     * Refresh the cache for users with similar roles to the current user.
+     */
+    private function refreshCacheForUsersWithSimilarRoles($user_roles)
+    {
+        $usersWithSimilarRoles = getUsersWithRoles(explode(";", $user_roles));
+        DB::startTransaction();
+        foreach ($usersWithSimilarRoles as $user) {
+
+            // Arguments field
+            $arguments = json_encode([
+                'user_id' => (int) $user,
+            ], JSON_HEX_QUOT | JSON_HEX_TAG);
+
+            // Search for existing job
+            $count = DB::queryFirstRow(
+                'SELECT COUNT(*) AS count
+                FROM ' . prefixTable('background_tasks') . '
+                WHERE is_in_progress = %i AND process_type = %s AND arguments = %s',
+                0,
+                'user_build_cache_tree',
+                $arguments
+            )['count'];
+
+            // Don't insert duplicates
+            if ($count > 0)
+                continue;
+
+            // Insert new background task
+            DB::insert(
+                prefixTable('background_tasks'),
+                array(
+                    'created_at' => time(),
+                    'process_type' => 'user_build_cache_tree',
+                    'arguments' => $arguments,
+                    'updated_at' => null,
+                    'finished_at' => null,
+                    'output' => null,
+                )
+            );
+        }
+        DB::commit();
+    }
+
+    /**
+     * Returns an error response.
+     */
+    private function errorResponse($message, $newIdSuffix = "")
+    {
+        return [
+            'error' => true,
+            'message' => $message,
+            'newId' => '' . $newIdSuffix,
+        ];
+    }
+}

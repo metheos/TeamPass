@@ -27,9 +27,9 @@ INSTALL_MODE="${INSTALL_MODE:-manual}"
 TEAMPASS_URL="${TEAMPASS_URL:-http://localhost}"
 
 # Extract version from PHP constants (TP_VERSION and TP_VERSION_MINOR)
-if [ -f "/var/www/html/includes/config/include.php" ]; then
-    TP_VERSION=$(grep "define('TP_VERSION'" /var/www/html/includes/config/include.php | sed -n "s/.*'\([0-9.]*\)'.*/\1/p")
-    TP_VERSION_MINOR=$(grep "define('TP_VERSION_MINOR'" /var/www/html/includes/config/include.php | sed -n "s/.*'\([0-9]*\)'.*/\1/p")
+if [ -f "/var/www/html/app/config/include.php" ]; then
+    TP_VERSION=$(grep "define('TP_VERSION'" /var/www/html/app/config/include.php | sed -n "s/.*'\([0-9.]*\)'.*/\1/p")
+    TP_VERSION_MINOR=$(grep "define('TP_VERSION_MINOR'" /var/www/html/app/config/include.php | sed -n "s/.*'\([0-9]*\)'.*/\1/p")
     TEAMPASS_VERSION="${TP_VERSION}.${TP_VERSION_MINOR}"
 else
     # Fallback if include.php is not available yet
@@ -67,17 +67,20 @@ wait_for_database() {
 
 # Function to check if TeamPass is already installed
 is_installed() {
-    [ -f "/var/www/html/includes/config/settings.php" ]
+    [ -f "/var/www/html/app/config/settings.php" ]
 }
 
 # Function to create required directories
 create_directories() {
     echo -e "${BLUE}📁 Creating required directories...${NC}"
 
-    mkdir -p /var/www/html/sk
-    mkdir -p /var/www/html/files
-    mkdir -p /var/www/html/upload
-    mkdir -p /var/www/html/includes/libraries/csrfp/log
+    mkdir -p /var/www/html/storage/sk
+    mkdir -p /var/www/html/storage/files
+    mkdir -p /var/www/html/storage/upload
+    mkdir -p /var/www/html/storage/config
+    mkdir -p /var/www/html/storage/backups
+    mkdir -p /var/www/html/secrets
+    mkdir -p /var/www/html/app/includes/libraries/csrfp/log
 
     echo -e "${GREEN}✅ Directories created${NC}"
 }
@@ -86,17 +89,95 @@ create_directories() {
 set_permissions() {
     echo -e "${BLUE}🔒 Setting file permissions...${NC}"
 
-    chown -R nginx:nginx /var/www/html/sk
-    chown -R nginx:nginx /var/www/html/files
-    chown -R nginx:nginx /var/www/html/upload
-    chown -R nginx:nginx /var/www/html/includes/libraries/csrfp/log
+    # The storage/ root itself must be writable by nginx so PHP can create
+    # runtime sub-directories, and the installer "writable" check passes (issue #5238).
+    chown nginx:nginx /var/www/html/storage
+    chown -R nginx:nginx /var/www/html/storage/sk
+    chown -R nginx:nginx /var/www/html/storage/files
+    chown -R nginx:nginx /var/www/html/storage/upload
+    chown -R nginx:nginx /var/www/html/storage/config
+    chown -R nginx:nginx /var/www/html/storage/backups
+    chown -R nginx:nginx /var/www/html/secrets
+    chown -R nginx:nginx /var/www/html/app/includes/libraries/csrfp/log
 
-    chmod 700 /var/www/html/sk
-    chmod 750 /var/www/html/files
-    chmod 750 /var/www/html/upload
-    chmod 750 /var/www/html/includes/libraries/csrfp/log
+    chmod 750 /var/www/html/storage
+    chmod 700 /var/www/html/storage/sk
+    chmod 750 /var/www/html/storage/files
+    chmod 750 /var/www/html/storage/upload
+    chmod 750 /var/www/html/storage/config
+    chmod 750 /var/www/html/storage/backups
+    chmod 700 /var/www/html/secrets
+    chmod 750 /var/www/html/app/includes/libraries/csrfp/log
 
     echo -e "${GREEN}✅ Permissions set${NC}"
+}
+
+# Redirect an application config file to a persistent copy through a symlink.
+# $1 = path used by the application, $2 = path on the persistent volume.
+# An existing real file is migrated into the volume once, so already-installed
+# containers keep their configuration on first upgrade to this image.
+link_persistent_file() {
+    app_file="$1"
+    persist_file="$2"
+
+    # Make sure the persistent target directory exists before any move/link.
+    mkdir -p "$(dirname "$persist_file")"
+
+    # Migrate a pre-existing real file into the persistent volume (only once).
+    if [ -f "$app_file" ] && [ ! -L "$app_file" ] && [ ! -f "$persist_file" ]; then
+        mv "$app_file" "$persist_file"
+    fi
+
+    # Point the application path to the persistent copy so that both the
+    # installer (write) and the application (read) use the volume-backed file.
+    if [ ! -L "$app_file" ]; then
+        rm -f "$app_file"
+        ln -s "$persist_file" "$app_file"
+    fi
+
+    # Force ownership and mode so PHP-FPM (running as the nginx user) can read
+    # AND write the persistent file. A file copied in from an on-premise install
+    # may arrive owned by www-data or with restrictive bits, which otherwise
+    # fails the installer "writable" check (issue #5238).
+    chown -h nginx:nginx "$app_file" 2>/dev/null || true
+    if [ -f "$persist_file" ]; then
+        chown nginx:nginx "$persist_file"
+        chmod 0640 "$persist_file"
+    fi
+}
+
+# Ensure install-time state survives container recreation.
+#
+# In TeamPass 3.2 the installer writes three artifacts that live outside the
+# default data volumes and are therefore lost when the container is recreated
+# (docker compose down && up). Their loss makes TeamPass believe it is not
+# installed and triggers a reinstall on every restart (issue #5236):
+#
+#   - app/config/settings.php                             (DB credentials + install marker)
+#   - app/includes/libraries/csrfp/libs/csrfp.config.php  (CSRF config, fatal if missing)
+#   - secrets/<random>                                    (Defuse master key)
+#
+# settings.php and csrfp.config.php are redirected through symlinks to the
+# persistent config volume (storage/config) so the installer transparently
+# writes to the volume. The secrets directory is mounted as a volume directly
+# (handled in docker-compose / Dockerfile), here we only ensure it exists.
+persist_install_state() {
+    echo -e "${BLUE}🔗 Ensuring install state persistence...${NC}"
+
+    PERSIST_DIR=/var/www/html/storage/config
+    mkdir -p "$PERSIST_DIR"
+
+    link_persistent_file \
+        /var/www/html/app/config/settings.php \
+        "$PERSIST_DIR/settings.php"
+    link_persistent_file \
+        /var/www/html/app/includes/libraries/csrfp/libs/csrfp.config.php \
+        "$PERSIST_DIR/csrfp.config.php"
+
+    chown nginx:nginx "$PERSIST_DIR" 2>/dev/null || true
+    chmod 750 "$PERSIST_DIR" 2>/dev/null || true
+
+    echo -e "${GREEN}✅ Install state persistence ensured${NC}"
 }
 
 # Function to apply dynamic PHP configuration from environment variables.
@@ -128,8 +209,8 @@ auto_install() {
     fi
 
     # Check if install-cli.php exists
-    if [ -f "/var/www/html/scripts/install-cli.php" ]; then
-        php /var/www/html/scripts/install-cli.php \
+    if [ -f "/var/www/html/app/scripts/install-cli.php" ]; then
+        php /var/www/html/app/scripts/install-cli.php \
             --db-host="$DB_HOST" \
             --db-port="$DB_PORT" \
             --db-name="$DB_NAME" \
@@ -142,7 +223,7 @@ auto_install() {
 
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}✅ Automatic installation completed successfully!${NC}"
-            rm -rf /var/www/html/install
+            rm -rf /var/www/html/public/install
         else
             echo -e "${RED}❌ Automatic installation failed${NC}"
             exit 1
@@ -153,20 +234,31 @@ auto_install() {
     fi
 }
 
+# Read the TeamPass version recorded in the database.
+# Delegates to a PHP helper that connects with the credentials stored in
+# app/config/settings.php (the installed source of truth) using the bundled
+# mysqli extension. This avoids depending on the "mysql" client binary, which
+# is not part of the image and made the auto-upgrade fail silently (issue
+# #5266), and removes the reliance on environment variables for the upgrade.
+# The helper already tries the current key (teampass_version) then the legacy
+# key (cpassman_version) used by TeamPass 3.1.5.x and earlier (issue #5238).
+# Echoes the version string, or nothing when it cannot be read.
+read_db_version() {
+    _helper="/var/www/html/app/scripts/read-db-version.php"
+    if [ -f "$_helper" ]; then
+        php "$_helper" 2>/dev/null || true
+    fi
+}
+
 # Function to run pending database migrations when the container image is
 # newer than the version recorded in teampass_misc.  The upgrade scripts are
 # idempotent (CREATE TABLE IF NOT EXISTS / ALTER ... IF NOT EXISTS), so it is
 # safe to re-run them on an already up-to-date database.
 auto_upgrade() {
-    if [ -z "$DB_PASSWORD" ]; then
-        echo -e "${YELLOW}⚠️  DB_PASSWORD not set, skipping auto-upgrade check${NC}"
-        return 0
-    fi
-
-    # Read the version stored in the database
-    DB_VERSION=$(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASSWORD" \
-        "$DB_NAME" --skip-column-names --silent \
-        -e "SELECT valeur FROM ${DB_PREFIX}misc WHERE type='admin' AND intitule='teampass_version' LIMIT 1" 2>/dev/null || true)
+    # Read the version stored in the database (current or legacy key). The
+    # helper reads the DB credentials from settings.php, so no environment
+    # variable is required here for an already-installed instance.
+    DB_VERSION=$(read_db_version)
 
     if [ -z "$DB_VERSION" ]; then
         echo -e "${YELLOW}⚠️  Could not read DB version, skipping auto-upgrade${NC}"
@@ -183,19 +275,16 @@ auto_upgrade() {
 
     echo -e "${BLUE}🔄 Upgrading database from ${DB_VERSION} to ${IMAGE_VERSION}...${NC}"
 
-    UPGRADE_SCRIPT="/var/www/html/install/upgrade_run_${IMAGE_VERSION}.php"
+    UPGRADE_SCRIPT="/var/www/html/public/install/upgrade_run_${IMAGE_VERSION}.php"
     if [ ! -f "$UPGRADE_SCRIPT" ]; then
         echo -e "${YELLOW}⚠️  No upgrade script found for ${IMAGE_VERSION}, skipping${NC}"
         return 0
     fi
 
-    php "$UPGRADE_SCRIPT" \
-        --db-host="$DB_HOST" \
-        --db-port="$DB_PORT" \
-        --db-name="$DB_NAME" \
-        --db-user="$DB_USER" \
-        --db-password="$DB_PASSWORD" \
-        --db-prefix="$DB_PREFIX"
+    # The upgrade script bootstraps through loadClasses('DB'), which reads the
+    # connection parameters (and decrypts the DB password) from settings.php,
+    # so no --db-* arguments / environment variables are needed here.
+    php "$UPGRADE_SCRIPT"
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✅ Database upgrade to ${IMAGE_VERSION} completed${NC}"
@@ -219,8 +308,8 @@ manual_install_instructions() {
     echo "   - User: ${DB_USER}"
     echo "   - Password: [Use the password from your .env file]"
     echo ""
-    echo "   Saltkey absolute path:"
-    echo -e "   ${BLUE}/var/www/html/sk${NC}"
+    echo "   The secure (saltkey) path is auto-configured by the installer to:"
+    echo -e "   ${BLUE}/var/www/html/secrets${NC}"
     echo ""
     echo "   After installation, restart the container to remove the install directory:"
     echo -e "   ${BLUE}docker-compose restart teampass${NC}"
@@ -241,6 +330,10 @@ main() {
     # Set permissions
     set_permissions
 
+    # Redirect install state (settings.php + csrfp.config.php) to the persistent
+    # volume so the installation survives container recreation (issue #5236).
+    persist_install_state
+
     # Configure PHP-FPM to listen on 127.0.0.1:9000 and run as nginx user
     if [ -f /usr/local/etc/php-fpm.d/www.conf ]; then
         sed -i 's/listen = .*/listen = 127.0.0.1:9000/' /usr/local/etc/php-fpm.d/www.conf
@@ -249,22 +342,34 @@ main() {
     fi
 
     # Configure cron job for scheduler
-    echo "* * * * * php /var/www/html/sources/scheduler.php > /dev/null 2>&1" | crontab -u nginx -
+    echo "* * * * * php /var/www/html/app/sources/scheduler.php > /dev/null 2>&1" | crontab -u nginx -
 
     # Check installation status
     if is_installed; then
         echo -e "${GREEN}✅ TeamPass is already configured${NC}"
 
-        # Remove install directory if it exists (keep it during upgrades so
-        # upgrade.php is accessible, then remove once complete)
-        if [ -d "/var/www/html/install" ]; then
-            echo -e "${BLUE}🗑️  Removing install directory...${NC}"
-            rm -rf /var/www/html/install
-        fi
-
         # Auto-upgrade: apply pending database migrations when the image
         # version is newer than the version recorded in teampass_misc.
         auto_upgrade
+
+        # Remove the install directory only when the database is confirmed to be
+        # already at the image version. While an upgrade is pending (e.g. a
+        # database migrated from an older on-premise install), the install
+        # directory is kept so that /install/upgrade.php remains reachable to
+        # finish the upgrade through the web wizard (issue #5238). If the version
+        # cannot be read, the directory is also kept: removing it would strand a
+        # possibly-pending upgrade with no way to recover (issue #5266).
+        if [ -d "/var/www/html/public/install" ]; then
+            CURRENT_DB_VERSION=$(read_db_version)
+            if [ -z "$CURRENT_DB_VERSION" ]; then
+                echo -e "${YELLOW}⚠️  Could not read DB version; keeping install directory so /install/upgrade.php stays reachable${NC}"
+            elif [ "$CURRENT_DB_VERSION" != "${TP_VERSION:-${TEAMPASS_VERSION}}" ]; then
+                echo -e "${YELLOW}⏳ Upgrade pending (DB ${CURRENT_DB_VERSION} → ${TP_VERSION:-${TEAMPASS_VERSION}}); keeping install directory for /install/upgrade.php${NC}"
+            else
+                echo -e "${BLUE}🗑️  Removing install directory...${NC}"
+                rm -rf /var/www/html/public/install
+            fi
+        fi
     else
         echo -e "${YELLOW}⚙️  TeamPass is not configured yet${NC}"
 

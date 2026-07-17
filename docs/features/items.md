@@ -29,7 +29,7 @@ Clicking a row expands it to reveal the full item details without leaving the li
 |-------|-------------|
 | **Label** | Name of the item — the only required field |
 | **Login** | Username or account identifier |
-| **Password** | The credential. Use the generator icon to create a random password that meets the folder's complexity requirements |
+| **Password** | The credential. Use the built-in generator to produce a random password or passphrase that meets the folder's complexity requirements (see [Password generator](#password-generator)) |
 | **URL** | Address of the associated service |
 | **Description** | Free-text notes; supports basic formatting |
 | **Tags** | Comma-separated keywords for filtering |
@@ -133,6 +133,45 @@ In the item detail view, attached files appear as download links in the **Attach
 ### Limits
 
 The maximum file size is defined by the administrator in **Settings**. Exceeding it will show an error at upload time.
+
+---
+
+## Password generator
+
+The built-in generator sits below the **Password** field of the create / edit form. Pick a mode, adjust its options, and press **Generate** — the result always satisfies both your options and the minimum complexity required by the containing folder.
+
+Two modes are selected with the toggle above the options:
+
+- **Random** — a random string built from the selected character classes.
+- **Passphrase** — a memorable sequence of words from a BIP39 wordlist.
+
+Only the options of the selected mode are shown, and changing any option (or switching mode) regenerates the value immediately.
+
+### Strength coaching
+
+Below the strength bar, a short coaching line estimates the secret's entropy in bits and how long it would take to crack **offline**, then suggests how to reach a stronger level (for example, *"add 2 words"* or *"add 4 characters"*). The estimate is based on the generator's own entropy — the honest measure for a randomly generated secret.
+
+### Complexity-aware generation
+
+Each folder can have a minimum complexity level set by an administrator. The generator enforces these minimums automatically — if the folder requires uppercase letters and digits, they are included even if the user did not select those options.
+
+| Complexity level | Minimum requirements |
+|-----------------|----------------------|
+| **None** (0) | No constraint — any character set, length ≥ 4 |
+| **Low** (20) | Lowercase + digits, length ≥ 8 |
+| **Medium** (38) | Lower + upper + digits, length ≥ 12 |
+| **High** (48) | Lower + upper + digits, length ≥ 16 |
+| **Very high** (60) | Lower + upper + digits + symbols, length ≥ 16 |
+
+In **Random** mode the character classes required by the folder are pre-selected and **locked**, and lengths below the folder minimum are disabled — so the options always reflect what will actually be produced. The requested length is capped at the application-wide **Password maximum length** setting.
+
+### BIP39 mnemonic passphrase
+
+The **Passphrase** mode builds a passphrase from a BIP39 wordlist. Passphrases are easier to remember while remaining strong.
+
+Wordlists are available in the following languages: English, French, Spanish, Italian, Czech, Portuguese, Japanese, and Chinese. The interface language is used automatically; all others fall back to English.
+
+Passphrase mode also adapts to the folder's complexity: it raises the minimum number of words, capitalizes each word from **Medium** upward, and appends a digit and a symbol at **Very high** — so a passphrase can meet the folder requirement without switching to Random mode.
 
 ---
 

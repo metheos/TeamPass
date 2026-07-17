@@ -1,0 +1,5598 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Teampass - a collaborative passwords manager.
+ * ---
+ * This file is part of the TeamPass project.
+ * 
+ * TeamPass is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3 of the License.
+ * 
+ * TeamPass is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * 
+ * Certain components of this file may be under different licenses. For
+ * details, see the `licenses` directory or individual file headers.
+ * ---
+ * @file      users.queries.php
+ * @author    Nils Laumaillé (nils@teampass.net)
+ * @copyright 2009-2026 Teampass.net
+ * @license   GPL-3.0
+ * @see       https://www.teampass.net
+ */
+
+use LdapRecord\Connection;
+use TeampassClasses\NestedTree\NestedTree;
+use TeampassClasses\SessionManager\SessionManager;
+use Symfony\Component\HttpFoundation\Request as SymfonyRequest;
+use TeampassClasses\Language\Language;
+use TeampassClasses\PerformChecks\PerformChecks;
+use TeampassClasses\ConfigManager\ConfigManager;
+use TeampassClasses\PasswordManager\PasswordManager;
+use TeampassClasses\EmailService\EmailService;
+use TeampassClasses\EmailService\EmailSettings;
+use TeampassClasses\OAuth2Controller\OAuth2Controller;
+use TeampassClasses\LdapExtra\OpenLdapExtra;
+use TeampassClasses\LdapExtra\ActiveDirectoryExtra;
+
+// Load functions
+require_once 'main.functions.php';
+
+// init
+loadClasses('DB');
+$session = SessionManager::getSession();
+$request = SymfonyRequest::createFromGlobals();
+$lang = new Language($session->get('user-language') ?? 'english');
+
+// Load config
+$configManager = new ConfigManager();
+$SETTINGS = $configManager->getAllSettings();
+
+// Do checks
+$checkUserAccess = new PerformChecks(
+    dataSanitizer(
+        [
+            'type' => htmlspecialchars($request->request->get('type', ''), ENT_QUOTES, 'UTF-8'),
+        ],
+        [
+            'type' => 'trim|escape',
+        ],
+    ),
+    [
+        'user_id' => returnIfSet($session->get('user-id'), null),
+        'user_key' => returnIfSet($session->get('key'), null),
+    ]
+);
+// Handle the case
+echo $checkUserAccess->caseHandler();
+if ($checkUserAccess->checkSession() === false || $checkUserAccess->userAccessPage('profile') === false) {
+    // Not allowed page
+    $session->set('system-error_code', ERR_NOT_ALLOWED);
+    include TEAMPASS_ROOT . '/public/error.php';
+    exit;
+}
+
+// Define Timezone
+date_default_timezone_set($SETTINGS['timezone'] ?? 'UTC');
+
+// Set header properties
+header('Content-type: text/html; charset=utf-8');
+header('Cache-Control: no-cache, no-store, must-revalidate');
+
+// --------------------------------- //
+
+// Prepare post variables
+$post_key = filter_input(INPUT_POST, 'key', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+$post_type = filter_input(INPUT_POST, 'type', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+$post_data = filter_input(INPUT_POST, 'data', FILTER_SANITIZE_FULL_SPECIAL_CHARS, FILTER_FLAG_NO_ENCODE_QUOTES);
+$isprofileupdate = filter_input(INPUT_POST, 'isprofileupdate', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+$password_do_not_change = 'do_not_change';
+
+
+//Load Tree
+$tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+
+if (null !== $post_type) {
+
+    // List of post types allowed to all users
+    $all_users_can_access = [
+        'get_generate_keys_progress',
+        'user_profile_update',
+        'user_profile_avatar_delete',
+        'save_user_change',
+        'generate_extension_token',
+        'list_extension_tokens',
+        'revoke_extension_token',
+        'build_extension_autoconfig',
+        'list_api_sessions',
+        'revoke_api_session',
+        'set_onboarding_completed',
+    ];
+
+    // decrypt and retrieve data in JSON format
+    $dataReceived = [];
+    if (!empty($post_data)) {
+        $dataReceived = prepareExchangedData(
+            $post_data,
+            'decode'
+        );
+    }
+
+    // Non-manager user
+    if ((int) $session->get('user-admin') !== 1 &&
+        (int) $session->get('user-manager') !== 1 &&
+        (int) $session->get('user-can_manage_all_users') !== 1) {
+
+        // Administrative type requested -> deny
+        if (!in_array($post_type, $all_users_can_access)) {
+            echo prepareExchangedData(
+                array(
+                    'error' => true,
+                    'message' => $lang->get('error_not_allowed_to'),
+                ),
+                'encode'
+            );
+            exit;
+        } else if (isset($dataReceived['user_id'])) {
+            // If user isn't manager, he can't change user_id
+            $dataReceived['user_id'] = (int) $session->get('user-id');
+        }
+    }
+
+    // For administrative types only, do additional check whether user is manager 
+    // and $dataReceived['user_id'] is defined to ensure that this manager can
+    // modify this user account.
+    if (!in_array($post_type, $all_users_can_access) &&
+        (int) $session->get('user-admin') !== 1 && !empty($dataReceived['user_id'])) {
+
+        // Get info about user to modify
+        $targetUserInfos = DB::queryFirstRow(
+            'SELECT admin, gestionnaire, can_manage_all_users, isAdministratedByRole FROM ' . prefixTable('users') . '
+            WHERE id = %i',
+            (int) $dataReceived['user_id']
+        );
+
+        // User not exists
+        if (DB::count() === 0) {
+            echo prepareExchangedData(
+                array(
+                    'error' => true,
+                    'message' => $lang->get('error_not_allowed_to'),
+                ),
+                'encode'
+            );
+            exit;
+        }
+
+        // Managers can't edit administrator or other manager
+        if ((int) $targetUserInfos['admin'] === 1 ||
+            (int) $targetUserInfos['can_manage_all_users'] === 1 ||
+            (int) $targetUserInfos['gestionnaire'] === 1) {
+
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                exit;
+            }
+
+        // Manager of basic/ro users in this role
+        if ((int) $session->get('user-manager') === 1
+            && !in_array($targetUserInfos['isAdministratedByRole'], $session->get('user-roles_array'))) {
+
+            echo prepareExchangedData(
+                array(
+                    'error' => true,
+                    'message' => $lang->get('error_not_allowed_to'),
+                ),
+                'encode'
+            );
+            exit;
+        }
+    }
+
+    switch ($post_type) {
+        /*
+         * BROWSER EXTENSION TOKENS (Personal Access Tokens for OAuth2/SSO users)
+         *
+         * Reserved for OAuth2 users and gated by the admin toggle oauth2_api_enabled.
+         * The cleartext private key (held in session while the user is authenticated in
+         * the web UI) is re-wrapped under a key derived from the freshly generated token,
+         * so the API can later unwrap it without the user's password. Only the token hash
+         * is persisted; the token itself is returned exactly once.
+         */
+        case 'generate_extension_token':
+        case 'list_extension_tokens':
+        case 'revoke_extension_token':
+            // Feature gate: API enabled, AND either
+            //   - OAuth2-for-API enabled and the current user is OAuth2, OR
+            //   - extension tokens allowed for all auth types (local/LDAP/OAuth2).
+            $extTokenOauth2 = (int) ($SETTINGS['oauth2_api_enabled'] ?? 0) === 1
+                && $session->get('user-auth_type') === 'oauth2';
+            $extTokenAllAuthTypes = (int) ($SETTINGS['extension_token_all_auth_types'] ?? 0) === 1;
+            if ((int) ($SETTINGS['api'] ?? 0) !== 1
+                || ($extTokenOauth2 === false && $extTokenAllAuthTypes === false)
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $userId = (int) $session->get('user-id');
+
+            if ($post_type === 'generate_extension_token') {
+                // The cleartext private key must be available in the current session.
+                $privateKeyClear = (string) $session->get('user-private_key');
+                if ($privateKeyClear === '' || $privateKeyClear === 'none') {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('error_no_user_keys'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+
+                require_once __DIR__ . '/../api/inc/encryption_utils.php';
+
+                $label = trim((string) filter_var($dataReceived['label'] ?? '', FILTER_SANITIZE_FULL_SPECIAL_CHARS));
+                $label = $label !== '' ? mb_substr($label, 0, 255) : null;
+
+                $tokenPlain = bin2hex(random_bytes(32));
+                $salt       = bin2hex(random_bytes(16));
+                $wrapKey    = hash_hkdf('sha256', $tokenPlain, 32, 'teampass-extension-token-v1', (string) hex2bin($salt));
+                $wrapped    = encrypt_with_session_key($privateKeyClear, $wrapKey);
+
+                if ($wrapped === false) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('error'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+
+                DB::insert(prefixTable('api_tokens'), [
+                    'user_id'             => $userId,
+                    'token_hash'          => hash('sha256', $tokenPlain),
+                    'wrapped_private_key' => $wrapped,
+                    'salt'                => $salt,
+                    'label'               => $label,
+                    'created_at'          => time(),
+                    'expires_at'          => null,
+                ]);
+                $newId = (int) DB::insertId();
+
+                logEvents($SETTINGS, 'user_mngt', 'at_extension_token_generated', (string) $userId, (string) $session->get('user-login'), (string) $newId);
+
+                // Token returned ONCE; only its sha256 hash is persisted.
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'token' => $tokenPlain,
+                        'id' => $newId,
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if ($post_type === 'revoke_extension_token') {
+                $tokenId = (int) ($dataReceived['id'] ?? 0);
+                if ($tokenId > 0) {
+                    DB::delete(prefixTable('api_tokens'), 'id = %i AND user_id = %i', $tokenId, $userId);
+                    logEvents($SETTINGS, 'user_mngt', 'at_extension_token_revoked', (string) $userId, (string) $session->get('user-login'), (string) $tokenId);
+                }
+                echo prepareExchangedData(array('error' => false), 'encode');
+                break;
+            }
+
+            // list_extension_tokens — never returns the token value itself.
+            $tokensList = DB::query(
+                'SELECT id, label, created_at, expires_at, last_used_at
+                 FROM ' . prefixTable('api_tokens') . ' WHERE user_id = %i ORDER BY created_at DESC',
+                $userId
+            );
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'tokens' => $tokensList,
+                ),
+                'encode'
+            );
+            break;
+
+        /*
+         * ACTIVE API SESSIONS (one row per issued JWT, keyed by jti)
+         *
+         * Lets a user list and revoke their own API sessions (CI scripts, browser
+         * extension, mobile clients). Revocation flags the row — the matching JWT
+         * is then rejected on every API endpoint until it expires.
+         */
+        case 'list_api_sessions':
+        case 'revoke_api_session':
+            // Feature gate: API enabled
+            if ((int) ($SETTINGS['api'] ?? 0) !== 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $userId = (int) $session->get('user-id');
+
+            if ($post_type === 'revoke_api_session') {
+                $sessionId = (int) ($dataReceived['id'] ?? 0);
+                if ($sessionId > 0) {
+                    DB::update(
+                        prefixTable('api_sessions'),
+                        ['revoked_at' => time()],
+                        'id = %i AND user_id = %i AND revoked_at IS NULL',
+                        $sessionId,
+                        $userId
+                    );
+                    logEvents($SETTINGS, 'user_mngt', 'at_api_session_revoked', (string) $userId, (string) $session->get('user-login'), (string) $sessionId);
+                }
+                echo prepareExchangedData(array('error' => false), 'encode');
+                break;
+            }
+
+            // list_api_sessions — only live (non-revoked, non-expired) sessions;
+            // key material columns are never returned.
+            $sessionsList = DB::query(
+                'SELECT id, user_agent, created_at, expires_at, last_used_at
+                 FROM ' . prefixTable('api_sessions') . '
+                 WHERE user_id = %i AND revoked_at IS NULL AND expires_at >= %i
+                 ORDER BY created_at DESC',
+                $userId,
+                time()
+            );
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'sessions' => $sessionsList,
+                ),
+                'encode'
+            );
+            break;
+
+        /*
+         * BUILD BROWSER-EXTENSION AUTO-CONFIGURATION BUNDLE
+         *
+         * Returns a self-contained bundle the browser extension applies to configure
+         * itself: server URL, licence fields and a freshly minted, single-use,
+         * short-lived Personal Access Token. The password is never included — the
+         * extension authenticates in token mode. Same feature gate as the token cases.
+         */
+        case 'build_extension_autoconfig':
+            $extTokenOauth2 = (int) ($SETTINGS['oauth2_api_enabled'] ?? 0) === 1
+                && $session->get('user-auth_type') === 'oauth2';
+            $extTokenAllAuthTypes = (int) ($SETTINGS['extension_token_all_auth_types'] ?? 0) === 1;
+            if ((int) ($SETTINGS['api'] ?? 0) !== 1
+                || ($extTokenOauth2 === false && $extTokenAllAuthTypes === false)
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // The cleartext private key must be available in the current session.
+            $privateKeyClear = (string) $session->get('user-private_key');
+            if ($privateKeyClear === '' || $privateKeyClear === 'none') {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_no_user_keys'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            require_once __DIR__ . '/../api/inc/encryption_utils.php';
+
+            $userId = (int) $session->get('user-id');
+
+            // Mint a short-lived, single-use PAT wrapping the cleartext private key.
+            $tokenPlain = bin2hex(random_bytes(32));
+            $salt       = bin2hex(random_bytes(16));
+            $wrapKey    = hash_hkdf('sha256', $tokenPlain, 32, 'teampass-extension-token-v1', (string) hex2bin($salt));
+            $wrapped    = encrypt_with_session_key($privateKeyClear, $wrapKey);
+
+            if ($wrapped === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // The token is the durable credential the extension reuses for silent
+            // re-auth, so it must not expire (same model as manually generated
+            // tokens). The *bundle* below carries a short staleness window instead.
+            DB::insert(prefixTable('api_tokens'), [
+                'user_id'             => $userId,
+                'token_hash'          => hash('sha256', $tokenPlain),
+                'wrapped_private_key' => $wrapped,
+                'salt'                => $salt,
+                'label'               => 'auto-config ' . date('Y-m-d H:i'),
+                'created_at'          => time(),
+                'expires_at'          => null,
+            ]);
+            $newTokenId = (int) DB::insertId();
+
+            // Soft staleness guard for the bundle/file (not a hard security control —
+            // the bundle is unsigned; revoke the token to truly invalidate it).
+            $bundleExpiresAt = time() + 86400; // 24 hours
+
+            // Derive the server URL and its origin (scheme://host[:port]) from cpassman_url.
+            $teampassUrl = rtrim((string) ($SETTINGS['cpassman_url'] ?? ''), '/');
+            $extOrigin   = '';
+            $parsedUrl   = parse_url($teampassUrl);
+            if (isset($parsedUrl['scheme'], $parsedUrl['host']) === true) {
+                $extOrigin = $parsedUrl['scheme'] . '://' . $parsedUrl['host']
+                    . (isset($parsedUrl['port']) === true ? ':' . $parsedUrl['port'] : '');
+            }
+
+            $bundle = array(
+                'teampass_autoconfig' => true,
+                'version'             => 1,
+                'issued_at'           => time(),
+                'expires_at'          => $bundleExpiresAt,
+                'server'              => array(
+                    'teampass_url' => $teampassUrl,
+                    'origin'       => $extOrigin,
+                    'fqdn'         => (string) ($SETTINGS['browser_extension_fqdn'] ?? ''),
+                ),
+                'account'             => array(
+                    'username'     => (string) $session->get('user-login'),
+                    'display_name' => (string) $session->get('user-name'),
+                    'auth_mode'    => 'token',
+                ),
+                'credential'          => array(
+                    'auth_mode' => 'token',
+                    'token'     => $tokenPlain,
+                ),
+                'licence'             => array(
+                    'email' => (string) $session->get('user-email'),
+                    'fqdn'  => (string) ($SETTINGS['browser_extension_fqdn'] ?? ''),
+                    'key'   => (string) ($SETTINGS['browser_extension_key'] ?? ''),
+                ),
+                'nonce'               => bin2hex(random_bytes(16)),
+            );
+
+            logEvents($SETTINGS, 'user_mngt', 'at_extension_autoconfig_built', (string) $userId, (string) $session->get('user-login'), (string) $newTokenId);
+
+            echo prepareExchangedData(
+                array(
+                    'error'  => false,
+                    'bundle' => $bundle,
+                ),
+                'encode'
+            );
+            break;
+
+        /*
+         * F12 ONBOARDING WIZARD: flag the first-run wizard as completed or skipped
+         * for the current user. Allowed to every authenticated user (self only).
+         */
+        case 'set_onboarding_completed':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            DB::update(
+                prefixTable('users'),
+                array('onboarding_completed' => 1),
+                'id = %i',
+                (int) $session->get('user-id')
+            );
+            $session->set('user-onboarding_completed', 1);
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                ),
+                'encode'
+            );
+            break;
+
+        /*
+         * ADD NEW USER
+         */
+        case 'add_new_user':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Check if current user can add a new user
+            if ((int) $session->get('user-admin') === 0 && (int) $session->get('user-can_manage_all_users') === 0 && (int) $session->get('user-manager') === 0) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $login = filter_var($dataReceived['login'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $email = filter_var($dataReceived['email'], FILTER_SANITIZE_EMAIL);
+            $lastname = filter_var($dataReceived['lastname'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $name = filter_var($dataReceived['name'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $is_admin = filter_var($dataReceived['admin'], FILTER_SANITIZE_NUMBER_INT);
+            $is_manager = filter_var($dataReceived['manager'], FILTER_SANITIZE_NUMBER_INT);
+            $is_hr = filter_var($dataReceived['hr'], FILTER_SANITIZE_NUMBER_INT);
+            $is_read_only = filter_var($dataReceived['read_only'], FILTER_SANITIZE_NUMBER_INT);
+            $has_personal_folder = filter_var($dataReceived['personal_folder'], FILTER_SANITIZE_NUMBER_INT);
+            $new_folder_role_domain = filter_var($dataReceived['new_folder_role_domain'], FILTER_SANITIZE_NUMBER_INT);
+            $domain = filter_var($dataReceived['domain'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $is_administrated_by = filter_var($dataReceived['isAdministratedByRole'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $groups = filter_var_array($dataReceived['groups'], FILTER_SANITIZE_NUMBER_INT);
+            $allowed_flds = filter_var_array($dataReceived['allowed_flds'], FILTER_SANITIZE_NUMBER_INT);
+            $forbidden_flds = filter_var_array($dataReceived['forbidden_flds'], FILTER_SANITIZE_NUMBER_INT);
+            $post_root_level = filter_var($dataReceived['form-create-root-folder'], FILTER_SANITIZE_NUMBER_INT);
+            $mfa_enabled = filter_var($dataReceived['mfa_enabled'], FILTER_SANITIZE_NUMBER_INT);
+
+            // Only administrators can create managers or administrators accounts.
+            if ((int) $session->get('user-admin') !== 1
+                && ((int) $is_admin === 1 || (int) $is_manager === 1 || (int) $is_hr === 1)) {
+
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Non-admin cannot grant can_create_root_folder if they don't have it themselves.
+            if ((int) $session->get('user-admin') !== 1 && (int) $session->get('user-can_create_root_folder') !== 1) {
+                $post_root_level = 0;
+            }
+
+            // Empty user
+            if (empty($login) === true) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_empty_data'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            // Check if user exists (active or soft-deleted)
+            $existingUser = DB::queryFirstRow(
+                'SELECT id, login, deleted_at
+                FROM ' . prefixTable('users') . '
+                WHERE (login = %s AND deleted_at IS NULL)
+                OR (login LIKE %s AND deleted_at IS NOT NULL)',
+                $login,
+                $login . '_deleted_%'
+            );
+
+            if (is_null($existingUser)) {
+                // Generate pwd
+                $password = generateQuickPassword();
+
+                // Generate new keys with transparent recovery support
+                $userKeys = generateUserKeys($password, $SETTINGS);
+
+                // load password library
+                $passwordManager = new PasswordManager();
+
+                // Prepare variables
+                $hashedPassword = $passwordManager->hashPassword($password);
+                if ($passwordManager->verifyPassword($hashedPassword, $password) === false) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('pw_hash_not_correct'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+
+                // Prepare user data for insertion
+                $userData = array(
+                    'login' => $login,
+                    'name' => $name,
+                    'lastname' => $lastname,
+                    'pw' => $hashedPassword,
+                    'email' => $email,
+                    'auth_type' => 'local',
+                    'admin' => empty($is_admin) === true ? 0 : $is_admin,
+                    'can_manage_all_users' => empty($is_hr) === true ? 0 : $is_hr,
+                    'gestionnaire' => empty($is_manager) === true ? 0 : $is_manager,
+                    'read_only' => empty($is_read_only) === true ? 0 : $is_read_only,
+                    'personal_folder' => empty($has_personal_folder) === true ? 0 : $has_personal_folder,
+                    'user_language' => $SETTINGS['default_language'],
+                    'isAdministratedByRole' => $is_administrated_by,
+                    'encrypted_psk' => '',
+                    'last_pw_change' => time(),
+                    'public_key' => $userKeys['public_key'],
+                    'private_key' => $userKeys['private_key'],
+                    'special' => 'auth-pwd-change',
+                    'is_ready_for_usage' => 0,
+                    'otp_provided' => 0,
+                    'can_create_root_folder' => empty($post_root_level) === true ? 0 : $post_root_level,
+                    'mfa_enabled' => empty($mfa_enabled) === true ? 0 : $mfa_enabled,
+                    'created_at' => time(),
+                    'personal_items_migrated' => 1,
+                    'encryption_version' => 3,
+                    'phpseclibv3_migration_completed' => 1,
+                );
+
+                // Add transparent recovery fields if available
+                if (isset($userKeys['user_seed'])) {
+                    $userData['user_derivation_seed'] = $userKeys['user_seed'];
+                    $userData['private_key_backup'] = $userKeys['private_key_backup'];
+                    $userData['key_integrity_hash'] = $userKeys['key_integrity_hash'];
+                    $userData['last_pw_change'] = time();
+                }
+
+                // Insert user in DB
+                DB::insert(
+                    prefixTable('users'),
+                    $userData
+                );
+                $new_user_id = DB::insertId();
+
+                // Store private key in dedicated table
+                insertPrivateKeyWithCurrentFlag($new_user_id, $userKeys['private_key']);
+
+                // Add Groups and Roles
+                setUserRoles($new_user_id, $groups, 'manual');
+                setUserGroups($new_user_id, $allowed_flds);
+                setUserForbiddenGroups($new_user_id, $forbidden_flds);
+
+                // Create personnal folder
+                if ((int) $has_personal_folder === 1) {
+                    DB::insert(
+                        prefixTable('nested_tree'),
+                        array(
+                            'parent_id' => '0',
+                            'title' => $new_user_id,
+                            'bloquer_creation' => '0',
+                            'bloquer_modification' => '0',
+                            'personal_folder' => '1',
+                            'categories' => '',
+                        )
+                    );
+                    $tree->rebuild();
+                }
+                // Create folder and role for domain
+                if ((int) $new_folder_role_domain === 1) {
+                    // create folder
+                    DB::insert(
+                        prefixTable('nested_tree'),
+                        array(
+                            'parent_id' => 0,
+                            'title' => $domain,
+                            'personal_folder' => 0,
+                            'renewal_period' => 0,
+                            'bloquer_creation' => '0',
+                            'bloquer_modification' => '0',
+                            'fa_icon' => 'fas fa-folder',
+                            'fa_icon_selected' => 'fas fa-folder-open',
+                            'categories' => '',
+                        )
+                    );
+                    $new_folder_id = DB::insertId();
+                    // Add complexity
+                    DB::insert(
+                        prefixTable('misc'),
+                        array(
+                            'type' => 'complex',
+                            'intitule' => $new_folder_id,
+                            'valeur' => 50,
+                            'created_at' => time(),
+                        )
+                    );
+                    // Create role
+                    DB::insert(
+                        prefixTable('roles_title'),
+                        array(
+                            'title' => $domain,
+                        )
+                    );
+                    $new_role_id = DB::insertId();
+                    // Associate new role to new folder
+                    DB::insert(
+                        prefixTable('roles_values'),
+                        array(
+                            'folder_id' => $new_folder_id,
+                            'role_id' => $new_role_id,
+                        )
+                    );
+                    // Add the new user to this role
+                    setUserRoles(
+                        $new_user_id,
+                        array_unique(array_merge($groups, [(int) $new_role_id])),
+                        'manual'
+                    );
+                    // rebuild tree
+                    $tree->rebuild();
+                }
+
+                // Create the API key
+                DB::insert(
+                    prefixTable('api'),
+                    array(
+                        'type' => 'user',
+                        'user_id' => $new_user_id,
+                        'value' => encryptUserObjectKey(base64_encode(base64_encode(uniqidReal(39))), $userKeys['public_key']),
+                        'timestamp' => time(),
+                    )
+                );
+
+                // get links url
+                if (empty($SETTINGS['email_server_url']) === true) {
+                    $SETTINGS['email_server_url'] = $SETTINGS['cpassman_url'];
+                }
+
+                // Launch process for user keys creation
+                // No OTP is provided here, no need.
+                handleUserKeys(
+                    (int) $new_user_id,
+                    (string) $password,
+                    isset($SETTINGS['maximum_number_of_items_to_treat']) === true ? (int) $SETTINGS['maximum_number_of_items_to_treat'] : NUMBER_ITEMS_IN_BATCH,
+                    "",
+                    true,
+                    true,
+                    true,
+                    false,
+                    'email_body_user_config_6',
+                );
+
+                // update LOG
+                logEvents(
+                    $SETTINGS,
+                    'user_mngt',
+                    'at_user_added',
+                    (string) $session->get('user-id'),
+                    $session->get('user-login'),
+                    (string) $new_user_id
+                );
+
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'user_id' => $new_user_id,
+                        'user_password' => $password,
+                        'message' => '',
+                    ),
+                    'encode'
+                );
+            } else {
+                // Check if it's a soft-deleted user
+                $errorMessage = $lang->get('error_user_exists');
+                if (empty($deletedUser) === false) {
+                    $errorMessage = 'A deleted user with this login already exists (ID: ' . $deletedUser['id'] . '). Please restore the user instead of creating a new one.';
+                }
+
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $errorMessage,
+                    ),
+                    'encode'
+                );
+            }
+            break;
+
+            /*
+         * Delete the user
+         */
+        case 'delete_user':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $userId  = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+
+            if (empty($userId)) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error_empty_data'),
+                    ],
+                    'encode'
+                );
+                break;
+            }
+
+            // Get info about user to delete
+            $data_user = DB::queryFirstRow(
+                'SELECT login, admin, isAdministratedByRole FROM ' . prefixTable('users') . '
+                WHERE id = %i',
+                $userId 
+            );        
+            if (empty($data_user)) {
+                throw new Exception($lang->get('error_user_not_exists'));
+            }
+
+            DB::startTransaction();
+            try {
+                // Is this user allowed to do this?
+                if (
+                    (int) $session->get('user-admin') === 1
+                    || (in_array($data_user['isAdministratedByRole'], $session->get('user-roles_array')))
+                    || ((int) $session->get('user-can_manage_all_users') === 1 && (int) $data_user['admin'] !== 1)
+                ) {
+                    $timestamp = time();
+                    $deletedSuffix = '_deleted_' . $timestamp;
+
+                    // delete user in database
+                    DB::update(
+                        prefixTable('users'),
+                        array(
+                            'login' => $data_user['login'].$deletedSuffix,
+                            'deleted_at' => $timestamp,
+                            'disabled' => 1,
+                            'special' => 'none',
+                        ),
+                        'id = %i',
+                        $userId
+                    );
+                    
+                    // update LOG
+                    logEvents($SETTINGS, 'user_mngt', 'at_user_deleted', (string) $session->get('user-id'), $session->get('user-login'), (string) $userId);
+
+                    // Count deleted users
+                    $deletedAccountsCount = (int) DB::queryFirstField("SELECT COUNT(id) FROM " . prefixTable('users') . " WHERE deleted_at IS NOT NULL");
+
+                    DB::commit();
+
+                    // Force-disconnect the deleted user if currently connected via WebSocket
+                    emitWebSocketEvent('session_expired', 'user', intval($userId), [
+                        'reason' => 'account_deleted',
+                    ]);
+
+                    //Send back
+                    echo prepareExchangedData(
+                        array(
+                            'error' => false,
+                            'message' => '',
+                            'deleted_accounts_count' => $deletedAccountsCount,
+                        ),
+                        'encode'
+                    );
+                } else {
+                    //Send back
+                    echo prepareExchangedData(
+                        array(
+                            'error' => false,
+                            'message' => $lang->get('error_not_allowed_to'),
+                        ),
+                        'encode'
+                    );
+                }
+            } catch (Exception $e) {
+                DB::rollback();
+                
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error') . ': ' . $e->getMessage(),
+                    ],
+                    'encode'
+                );
+            }
+            break;
+
+        /*
+         * Check the domain
+         */
+        case 'check_domain':
+            $return = array();
+            // Check if folder exists
+            $data = DB::query(
+                'SELECT * FROM ' . prefixTable('nested_tree') . '
+                WHERE title = %s AND parent_id = %i',
+                filter_input(INPUT_POST, 'domain', FILTER_SANITIZE_FULL_SPECIAL_CHARS),
+                '0'
+            );
+            $counter = DB::count();
+            if ($counter != 0) {
+                $return['folder'] = 'exists';
+            } else {
+                $return['folder'] = 'not_exists';
+            }
+            // Check if role exists
+            $data = DB::query(
+                'SELECT * FROM ' . prefixTable('roles_title') . '
+                WHERE title = %s',
+                filter_input(INPUT_POST, 'domain', FILTER_SANITIZE_FULL_SPECIAL_CHARS)
+            );
+            $counter = DB::count();
+            if ($counter != 0) {
+                $return['role'] = 'exists';
+            } else {
+                $return['role'] = 'not_exists';
+            }
+
+            echo json_encode($return);
+            break;
+
+        /*
+         * delete the timestamp value for specified user => disconnect
+         */
+        case 'disconnect_user':
+            // Check KEY
+            if (filter_input(INPUT_POST, 'key', FILTER_SANITIZE_FULL_SPECIAL_CHARS) !== filter_var($session->get('key'), FILTER_SANITIZE_FULL_SPECIAL_CHARS)) {
+                echo '[ { "error" : "key_not_conform" } ]';
+                break;
+            }
+
+            $post_user_id = (int) filter_input(INPUT_POST, 'user_id', FILTER_SANITIZE_NUMBER_INT);
+
+            // Get info about user to delete
+            $data_user = DB::queryFirstRow(
+                'SELECT admin, isAdministratedByRole, gestionnaire
+                FROM ' . prefixTable('users') . '
+                WHERE id = %i',
+                $post_user_id
+            );
+
+            // Is this user allowed to do this?
+            if (
+                (int) $session->get('user-admin') === 1
+                || (in_array($data_user['isAdministratedByRole'], $session->get('user-roles_array')))
+                || ((int) $session->get('user-can_manage_all_users') === 1 && (int) $data_user['admin'] !== 1)
+            ) {
+                // Do
+                DB::update(
+                    prefixTable('users'),
+                    array(
+                        'timestamp' => '',
+                        'key_tempo' => '',
+                        'session_end' => '',
+                    ),
+                    'id = %i',
+                    $post_user_id
+                );
+
+                // Also invalidate the user's API sessions so their JWTs are rejected
+                tpInvalidateUserApiSession($post_user_id);
+            }
+            break;
+
+        case 'disconnect_users_logged_in':
+            // Admin only + key check
+            if ($post_key !== $session->get('key') || (int) $session->get('user-admin') !== 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Exclude current admin by default (or explicit exclude_user_id)
+            $excludeUserId = (int) filter_input(INPUT_POST, 'exclude_user_id', FILTER_SANITIZE_NUMBER_INT);
+            if ($excludeUserId === 0 && null !== $session->get('user-id')) {
+                $excludeUserId = (int) $session->get('user-id');
+            }
+
+            $now = time();
+
+            try {
+                // Select IDs first to avoid multi-row update locking issues.
+                // A user counts as connected through the web (session_end) or
+                // through an API session that is neither revoked nor expired.
+                if ($excludeUserId > 0) {
+                    $rows = DB::query(
+                        'SELECT id
+                         FROM ' . prefixTable('users') . ' u
+                         WHERE u.id != %i
+                         AND (
+                            u.session_end >= %i
+                            OR EXISTS (
+                                SELECT 1
+                                FROM ' . prefixTable('api_sessions') . ' aps
+                                WHERE aps.user_id = u.id
+                                    AND aps.revoked_at IS NULL
+                                    AND aps.expires_at >= %i
+                            )
+                         )',
+                        $excludeUserId,
+                        $now,
+                        $now
+                    );
+                } else {
+                    $rows = DB::query(
+                        'SELECT id
+                         FROM ' . prefixTable('users') . ' u
+                         WHERE u.session_end >= %i
+                         OR EXISTS (
+                            SELECT 1
+                            FROM ' . prefixTable('api_sessions') . ' aps
+                            WHERE aps.user_id = u.id
+                                AND aps.revoked_at IS NULL
+                                AND aps.expires_at >= %i
+                         )',
+                        $now,
+                        $now
+                    );
+                }
+
+                // Disconnect each user one by one (same logic as disconnect_user)
+                foreach ($rows as $row) {
+                    DB::update(
+                        prefixTable('users'),
+                        array(
+                            'timestamp' => '',
+                            'key_tempo' => '',
+                            'session_end' => '',
+                        ),
+                        'id = %i',
+                        (int) $row['id']
+                    );
+
+                    // Also invalidate the user's API sessions
+                    tpInvalidateUserApiSession((int) $row['id']);
+                }
+
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'message' => $lang->get('done'),
+                    ),
+                    'encode'
+                );
+            } catch (\Throwable $e) {
+                // Prevent 500: return a controlled error (optionally log server-side)
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error'),
+                    ),
+                    'encode'
+                );
+            }
+            break;
+
+        /*
+         * Get user info
+         */
+        case 'get_user_info':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            
+            // Prepare variables
+            $post_id = (int) filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+
+            // Get info about user
+            $rowUser = getUserCompleteData(null, $post_id);
+
+            // Is this user allowed to do this?
+            if (
+                (int) $session->get('user-admin') === 1
+                || (in_array($rowUser['isAdministratedByRole'], $session->get('user-roles_array')) === true)
+                || ((int) $session->get('user-can_manage_all_users') === 1 && $rowUser['admin'] !== '1')
+            ) {
+                $arrData = array();
+                $arrFunction = array();
+                $arrMngBy = array();
+                $arrFldForbidden = array();
+                $arrFldAllowed = array();
+
+                //Build tree
+                $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+
+                // get FUNCTIONS
+                $functionsList = array();
+                $selected = '';
+                $users_functions = array_filter(array_unique(explode(';', $rowUser['fonction_id'].';'.$rowUser['roles_from_ad_groups'])));
+
+                $session->set('user-roles_array', explode(';', $session->get('user-roles')));
+                // Admins and users who can manage all users see every role so they
+                // can assign any role to the user they are editing. Other users
+                // (e.g. a role-manager who can edit only users sharing their role)
+                // only see the roles they personally hold.
+                if (
+                    (int) $session->get('user-admin') === 1
+                    || (int) $session->get('user-manager') === 1
+                    || (int) $session->get('user-can_manage_all_users') === 1
+                ) {
+                    $rows = DB::query(
+                        'SELECT id,title,creator_id FROM ' . prefixTable('roles_title') . ' ORDER BY title ASC'
+                    );
+                } else {
+                    $rows = DB::query(
+                        'SELECT id,title,creator_id FROM ' . prefixTable('roles_title') . ' WHERE id IN %li',
+                        $session->get('user-roles_array')
+                    );
+                }
+                foreach ($rows as $record) {
+                    if (
+                        (int) $session->get('user-admin') === 1
+                        || (((int) $session->get('user-manager') === 1 || (int) $session->get('user-can_manage_all_users') === 1))
+                    ) {
+                        if (in_array($record['id'], $users_functions)) {
+                            $selected = 'selected';
+
+                            array_push(
+                                $arrFunction,
+                                array(
+                                    'title' => $record['title'],
+                                    'id' => $record['id'],
+                                )
+                            );
+                        } else {
+                            $selected = '';
+                        }
+
+                        array_push(
+                            $functionsList,
+                            array(
+                                'title' => $record['title'],
+                                'id' => $record['id'],
+                                'selected' => $selected,
+                            )
+                        );
+                    }
+                }
+
+                // get MANAGEDBY
+                $rolesList = array();
+                $managedBy = array();
+                $selected = '';
+                $rows = DB::query('SELECT id,title FROM ' . prefixTable('roles_title') . ' ORDER BY title ASC');
+                foreach ($rows as $reccord) {
+                    $rolesList[$reccord['id']] = array('id' => $reccord['id'], 'title' => $reccord['title']);
+                }
+
+                array_push(
+                    $managedBy,
+                    array(
+                        'title' => $lang->get('administrators_only'),
+                        'id' => 0,
+                    )
+                );
+                foreach ($rolesList as $fonction) {
+                    // Admins and global user managers can assign any administration
+                    // role; role-managers are limited to roles they personally hold.
+                    if (
+                        (int) $session->get('user-admin') === 1
+                        || (int) $session->get('user-manager') === 1
+                        || (int) $session->get('user-can_manage_all_users') === 1
+                        || in_array($fonction['id'], $session->get('user-roles_array'))
+                    ) {
+                        if ($rowUser['isAdministratedByRole'] == $fonction['id']) {
+                            $selected = 'selected';
+
+                            array_push(
+                                $arrMngBy,
+                                array(
+                                    'title' => $fonction['title'],
+                                    'id' => $fonction['id'],
+                                )
+                            );
+                        } else {
+                            $selected = '';
+                        }
+
+                        array_push(
+                            $managedBy,
+                            array(
+                                'title' => $lang->get('managers_of') . ' ' . $fonction['title'],
+                                'id' => $fonction['id'],
+                                'selected' => $selected,
+                            )
+                        );
+                    }
+                }
+
+                if (count($arrMngBy) === 0) {
+                    array_push(
+                        $arrMngBy,
+                        array(
+                            'title' => $lang->get('administrators_only'),
+                            'id' => '0',
+                        )
+                    );
+                }
+
+                // get FOLDERS FORBIDDEN
+                $forbiddenFolders = array();
+                $userForbidFolders = explode(';', is_null($rowUser['groupes_interdits']) === true ? '' : $rowUser['groupes_interdits']);
+                $tree_desc = $tree->getDescendants();
+                foreach ($tree_desc as $t) {
+                    if (in_array($t->id, $session->get('user-accessible_folders')) && in_array($t->id, $session->get('user-personal_visible_folders')) === false) {
+                        $selected = '';
+                        if (in_array($t->id, $userForbidFolders)) {
+                            $selected = 'selected';
+
+                            array_push(
+                                $arrFldForbidden,
+                                array(
+                                    'title' => htmlspecialchars($t->title, ENT_COMPAT, 'UTF-8'),
+                                    'id' => $t->id,
+                                )
+                            );
+                        }
+                        array_push(
+                            $forbiddenFolders,
+                            array(
+                                'id' => $t->id,
+                                'selected' => $selected,
+                                'title' => @htmlspecialchars($t->title, ENT_COMPAT, 'UTF-8'),
+                            )
+                        );
+                    }
+                }
+
+                // get FOLDERS ALLOWED
+                $allowedFolders = array();
+                $userAllowFolders = explode(';', $rowUser['groupes_visibles']);
+                $tree_desc = $tree->getDescendants();
+                foreach ($tree_desc as $t) {
+                    if (
+                        in_array($t->id, $session->get('user-accessible_folders')) === true
+                        && in_array($t->id, $session->get('user-personal_visible_folders')) === false
+                    ) {
+                        $selected = '';
+                        if (in_array($t->id, $userAllowFolders)) {
+                            $selected = 'selected';
+
+                            array_push(
+                                $arrFldAllowed,
+                                array(
+                                    'title' => htmlspecialchars($t->title, ENT_COMPAT, 'UTF-8'),
+                                    'id' => $t->id,
+                                )
+                            );
+                        }
+
+                        array_push(
+                            $allowedFolders,
+                            array(
+                                'id' => $t->id,
+                                'selected' => $selected,
+                                'title' => @htmlspecialchars($t->title, ENT_COMPAT, 'UTF-8'),
+                            )
+                        );
+                    }
+                }
+
+                // get USER STATUS
+                if ($rowUser['disabled'] == 1) {
+                    $arrData['info'] = $lang->get('user_info_locked') . '<br><input type="checkbox" value="unlock" name="1" class="chk">&nbsp;<label for="1">' . $lang->get('user_info_unlock_question') . '</label><br><input type="checkbox"  value="delete" id="account_delete" class="chk mr-2" name="2" onclick="confirmDeletion()">label for="2">' . $lang->get('user_info_delete_question') . '</label>';
+                } else {
+                    $arrData['info'] = $lang->get('user_info_active') . '<br><input type="checkbox" value="lock" class="chk">&nbsp;' . $lang->get('user_info_lock_question');
+                }
+
+                $arrData['error'] = false;
+                $arrData['login'] = $rowUser['login'];
+                $arrData['name'] = empty($rowUser['name']) === false ? $rowUser['name'] : '';
+                $arrData['lastname'] = empty($rowUser['lastname']) === false ? $rowUser['lastname'] : '';
+                $arrData['email'] = $rowUser['email'];
+                $arrData['function'] = $functionsList;
+                $arrData['managedby'] = $managedBy;
+                $arrData['foldersForbid'] = $forbiddenFolders;
+                $arrData['foldersAllow'] = $allowedFolders;
+                $arrData['share_function'] = $arrFunction;
+                $arrData['share_managedby'] = $arrMngBy;
+                $arrData['share_forbidden'] = $arrFldForbidden;
+                $arrData['share_allowed'] = $arrFldAllowed;
+                $arrData['disabled'] = (int) $rowUser['disabled'];
+                $arrData['gestionnaire'] = (int) $rowUser['gestionnaire'];
+                $arrData['read_only'] = (int) $rowUser['read_only'];
+                $arrData['can_create_root_folder'] = (int) $rowUser['can_create_root_folder'];
+                $arrData['personal_folder'] = (int) $rowUser['personal_folder'];
+                $arrData['can_manage_all_users'] = (int) $rowUser['can_manage_all_users'];
+                $arrData['admin'] = (int) $rowUser['admin'];
+                $arrData['password'] = $password_do_not_change;
+                $arrData['mfa_enabled'] = (int) $rowUser['mfa_enabled'];
+                $avatarFile = basename(trim((string) ($rowUser['avatar'] ?? '')));
+                $avatarPath = TEAMPASS_ROOT . '/public/assets/avatars/' . $avatarFile;
+                $arrData['avatar_url'] = $avatarFile !== '' && is_file($avatarPath) === true
+                    ? rtrim((string) $SETTINGS['cpassman_url'], '/') . '/assets/avatars/' . rawurlencode($avatarFile)
+                    : '';
+
+                echo prepareExchangedData(
+                    $arrData,
+                    'encode'
+                );
+            } else {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+            }
+
+            break;
+
+        /*
+         * EDIT user
+         */
+        case 'store_user_changes':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_id = (int) filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+            $post_login = (string) filter_var($dataReceived['login'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_email = (string) filter_var($dataReceived['email'], FILTER_SANITIZE_EMAIL);
+            $post_lastname = (string) filter_var($dataReceived['lastname'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_name = (string) filter_var($dataReceived['name'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_is_admin = (int) filter_var($dataReceived['admin'], FILTER_SANITIZE_NUMBER_INT);
+            $post_is_manager = (int) filter_var($dataReceived['manager'], FILTER_SANITIZE_NUMBER_INT);
+            $post_is_hr = (int) filter_var($dataReceived['hr'], FILTER_SANITIZE_NUMBER_INT);
+            $post_is_read_only = (int) filter_var($dataReceived['read_only'], FILTER_SANITIZE_NUMBER_INT);
+            $post_has_personal_folder = (int) filter_var($dataReceived['personal_folder'], FILTER_SANITIZE_NUMBER_INT);
+            $post_is_administrated_by = (string) filter_var($dataReceived['isAdministratedByRole'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_groups = filter_var_array($dataReceived['groups'], FILTER_SANITIZE_NUMBER_INT);
+            $post_allowed_flds = filter_var_array($dataReceived['allowed_flds'], FILTER_SANITIZE_NUMBER_INT);
+            $post_forbidden_flds = filter_var_array($dataReceived['forbidden_flds'], FILTER_SANITIZE_NUMBER_INT);
+            $post_root_level = (int) filter_var($dataReceived['form-create-root-folder'], FILTER_SANITIZE_NUMBER_INT);
+            $post_mfa_enabled = (int) filter_var($dataReceived['mfa_enabled'], FILTER_SANITIZE_NUMBER_INT);
+
+            // Get info about user to modify
+            $data_user = DB::queryFirstRow(
+                'SELECT admin, gestionnaire, can_manage_all_users, isAdministratedByRole, can_create_root_folder
+                FROM ' . prefixTable('users') . '
+                WHERE id = %i',
+                $post_id
+            );
+
+            // If user removes administrator role on administrator user
+            // then ensure that it exists still one administrator
+            if ((int) $data_user['admin'] === 1 && (int) $post_is_admin !== 1) {
+                // count number of admins
+                $users = DB::query(
+                    'SELECT id
+                    FROM ' . prefixTable('users') . '
+                    WHERE admin = 1 AND email != "" AND pw != "" AND id != %i',
+                    $post_id
+                );
+                if (DB::count() === 0) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('at_least_one_administrator_is_requested'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+            }
+            
+            // Init post variables
+            $post_action_to_perform = filter_var(htmlspecialchars_decode($dataReceived['action_on_user']), FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $action_to_perform_after = '';
+            
+            // Exclude roles from AD - PR #3635
+            $adRolesResult = DB::query(
+                'SELECT role_id
+                FROM ' . prefixTable('users_roles') . '
+                WHERE user_id = %i AND source = %s',
+                $post_id,
+                'ad'
+            );
+            $adRoles = array_column($adRolesResult, 'role_id');
+
+            $fonctions = [];
+            if (!empty($adRoles)) {
+                foreach ($post_groups as $post_group) {
+                    if (!in_array($post_group, $adRoles)) {
+                        $fonctions[] = $post_group;
+                    }
+                }
+            }
+            $post_groups = empty($fonctions) === true ? $post_groups : $fonctions;
+
+
+            // Build array of update
+            $changeArray = array(
+                'login' => $post_login,
+                'name' => $post_name,
+                'lastname' => $post_lastname,
+                'email' => $post_email,
+                'admin' => empty($post_is_admin) === true ? 0 : $post_is_admin,
+                'can_manage_all_users' => empty($post_is_hr) === true ? 0 : $post_is_hr,
+                'gestionnaire' => empty($post_is_manager) === true ? 0 : $post_is_manager,
+                'read_only' => empty($post_is_read_only) === true ? 0 : $post_is_read_only,
+                'personal_folder' => empty($post_has_personal_folder) === true ? 0 : $post_has_personal_folder,
+                'user_language' => $SETTINGS['default_language'],
+                'isAdministratedByRole' => $post_is_administrated_by,
+                // Only admins can change can_create_root_folder; non-admins preserve the existing DB value.
+                'can_create_root_folder' => (int) $session->get('user-admin') === 1
+                    ? (empty($post_root_level) === true ? 0 : $post_root_level)
+                    : (int) ($data_user['can_create_root_folder'] ?? 0),
+                'mfa_enabled' => empty($post_mfa_enabled) === true ? 0 : $post_mfa_enabled,
+            );
+
+            // Manage user password change
+            // This can occur only if user changes his own password
+            // In other case, next condition must be wrong
+            if (
+                isset($post_password) === true
+                && $post_password !== $password_do_not_change
+                && $post_id === $session->get('user-id')
+            ) {
+                // load password library
+                $passwordManager = new PasswordManager();
+
+                $changeArray['pw'] = $passwordManager->hashPassword($post_password);
+                $changeArray['key_tempo'] = '';
+
+                // We need to adapt the private key with new password
+                // Re-encrypt private key and save to BOTH session AND database
+                $newPrivateKeyEncrypted = encryptPrivateKey($post_password, $session->get('user-private_key'));
+                $session->set('user-private_key', $newPrivateKeyEncrypted);
+                $changeArray['private_key'] = $newPrivateKeyEncrypted;
+            }
+
+            // Empty user
+            if (empty($post_login) === true) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_empty_data'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // User has email?
+            if (empty($post_email) === true) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_no_email'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Is this user allowed to do this?
+            if (
+                // Administrator user
+                (int) $session->get('user-admin') === 1
+                // Manager of basic/ro users in this role but don't allow promote user to admin or managers roles
+                || ((int) $session->get('user-manager') === 1
+                    && in_array($data_user['isAdministratedByRole'], $session->get('user-roles_array'))
+                    && (int) $post_is_admin !== 1 && (int) $data_user['admin'] !== 1
+                    && (int) $post_is_hr !== 1 && (int) $data_user['can_manage_all_users'] !== 1
+                    && (int) $post_is_manager !== 1 && (int) $data_user['gestionnaire'] !== 1)
+                // Manager of all basic/ro users but don't allow promote user to admin or managers roles
+                || ((int) $session->get('user-can_manage_all_users') === 1
+                    && (int) $post_is_admin !== 1 && (int) $data_user['admin'] !== 1
+                    && (int) $post_is_hr !== 1 && (int) $data_user['can_manage_all_users'] !== 1
+                    && (int) $post_is_manager !== 1 && (int) $data_user['gestionnaire'] !== 1)
+            ) {
+                // delete account
+                // delete user in database
+                if ($post_action_to_perform === 'delete') {
+                    DB::delete(
+                        prefixTable('users'),
+                        'id = %i',
+                        $post_id
+                    );
+                    // delete personal folder and subfolders
+                    $data = DB::queryFirstRow(
+                        'SELECT id FROM ' . prefixTable('nested_tree') . '
+                        WHERE title = %s AND personal_folder = %i',
+                        $post_id,
+                        '1'
+                    );
+                    // Get through each subfolder
+                    if (!empty($data['id'])) {
+                        $folders = $tree->getDescendants($data['id'], true);
+                        foreach ($folders as $folder) {
+                            // delete folder
+                            DB::delete(prefixTable('nested_tree'), 'id = %i AND personal_folder = %i', $folder->id, '1');
+                            // delete items & logs
+                            $items = DB::query(
+                                'SELECT id FROM ' . prefixTable('items') . '
+                                WHERE id_tree=%i AND perso = %i',
+                                $folder->id,
+                                '1'
+                            );
+                            foreach ($items as $item) {
+                                // Delete item
+                                DB::delete(prefixTable('items'), 'id = %i', $item['id']);
+                                // log
+                                DB::delete(prefixTable('log_items'), 'id_item = %i', $item['id']);
+                            }
+                        }
+                        // rebuild tree
+                        $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+                        $tree->rebuild();
+                    }
+
+                    // Delete Roles
+                    DB::delete(
+                        prefixTable('users_roles'),
+                        'user_id = %i',
+                        $post_id
+                    );
+
+                    // Delete Groups
+                    DB::delete(
+                        prefixTable('users_groups'),
+                        'user_id = %i',
+                        $post_id
+                    );
+                    DB::delete(
+                        prefixTable('users_groups_forbidden'),
+                        'user_id = %i',
+                        $post_id
+                    );
+
+                    // Delete Latest items
+                    DB::delete(
+                        prefixTable('users_latest_items'),
+                        'user_id = %i',
+                        $post_id
+                    );
+
+                    // Delete favorites
+                    DB::delete(
+                        prefixTable('users_favorites'),
+                        'user_id = %i',
+                        $post_id
+                    );
+
+
+                    // update LOG
+                    logEvents($SETTINGS, 'user_mngt', 'at_user_deleted', (string) $session->get('user-id'), $session->get('user-login'), (string) $post_id);
+                } else {
+                    // Get old data about user
+                    $oldData = getUserCompleteData(null, $post_id);
+
+                    // update SESSION
+                    if ($session->get('user-id') === $post_id) {
+                        $session->set('user-lastname', $post_lastname);
+                        $session->set('user-name', $post_name);
+                        $session->set('user-email', $post_email);
+                    }
+
+                    // Has the groups changed? If yes then ask for a keys regeneration
+                    $arrOldData = array_filter(explode(';', $oldData['fonction_id']));
+                    $post_groups = array_filter($post_groups);
+
+                    if ($arrOldData != $post_groups && (int) $oldData['admin'] !== 1) {
+                        $action_to_perform_after = 'encrypt_keys';
+                    }
+
+                    // update user
+                    DB::update(
+                        prefixTable('users'),
+                        $changeArray,
+                        'id = %i',
+                        $post_id
+                    );
+
+                    // Store private key in dedicated table (after users table update to prevent desync)
+                    if (isset($changeArray['private_key'])) {
+                        insertPrivateKeyWithCurrentFlag($post_id, $changeArray['private_key']);
+                    }
+
+                    // Add Groups and Roles
+                    setUserRoles($post_id, $post_groups, 'manual');
+                    setUserGroups($post_id, $post_allowed_flds);
+                    setUserForbiddenGroups($post_id, $post_forbidden_flds);
+
+                    // CLear cache tree for this user to force tree
+                    DB::delete(
+                        prefixTable('cache_tree'),
+                        'user_id = %i',
+                        $post_id
+                    );
+
+                    // Notify the affected user via WebSocket so their session rights and
+                    // jstree are refreshed in real-time, without requiring a page reload.
+                    // Skip if the admin is editing their own account (no push needed).
+                    if ($post_id !== (int) $session->get('user-id')) {
+                        emitWebSocketEvent(
+                            'folder_permission_changed',
+                            'user',
+                            $post_id,
+                            ['source' => 'direct_grant']
+                        );
+                    }
+
+                    // update LOG
+                    if ($oldData['email'] !== $post_email) {
+                        logEvents($SETTINGS, 'user_mngt', 'at_user_email_changed:' . $oldData['email'], (string) $session->get('user-id'), $session->get('user-login'), (string) $post_id);
+                    }
+                }
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'message' => '',
+                        'post_action' => $action_to_perform_after,
+                    ),
+                    'encode'
+                );
+            } else {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+            }
+            break;
+
+        /*
+         * IS LOGIN AVAILABLE?
+         */
+        case 'is_login_available':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $login = (string) filter_input(INPUT_POST, 'login', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            DB::queryFirstRow(
+                'SELECT * FROM ' . prefixTable('users') . '
+                WHERE (login = %s AND deleted_at IS NULL) 
+                OR login LIKE %s',
+                $login,
+                $login.'_deleted_%%'
+            );
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'login_exists' => DB::count(),
+                ),
+                'encode'
+            );
+
+            break;
+
+        /*
+         * GET USER FOLDER RIGHT
+         */
+        case 'user_folders_rights':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_id = (int) filter_input(INPUT_POST, 'user_id', FILTER_SANITIZE_NUMBER_INT);
+
+            $arrData = array();
+
+            //Build tree
+            $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+
+            // get User info
+            $rowUser = getUserCompleteData(null, $post_id);
+
+            // get rights
+            $arrFolders = [];
+            $foldersData = [];
+            $html = '';
+
+            if (isset($SETTINGS['ldap_mode']) === true && (int) $SETTINGS['ldap_mode'] === 1 && isset($SETTINGS['enable_ad_users_with_ad_groups']) === true && (int) $SETTINGS['enable_ad_users_with_ad_groups'] === 1) {
+                $rowUser['fonction_id'] = empty($rowUser['fonction_id'])  === true ? $rowUser['roles_from_ad_groups'] : $rowUser['fonction_id']. ';' . $rowUser['roles_from_ad_groups'];
+            }
+            $arrData['functions'] = array_filter(explode(';', $rowUser['fonction_id']));
+            $arrData['allowed_folders'] = array_filter(explode(';', $rowUser['groupes_visibles']));
+            $arrData['denied_folders'] = array_filter(explode(';', $rowUser['groupes_interdits']));
+
+            // Exit if no roles
+            if (count($arrData['functions']) > 0) {
+                // refine folders based upon roles
+                $rows = DB::query(
+                    'SELECT rv.folder_id, rv.type, rv.role_id, rt.title AS role_title
+                    FROM ' . prefixTable('roles_values') . ' as rv
+                    INNER JOIN ' . prefixTable('nested_tree') . ' as nt ON rv.folder_id = nt.id
+                    INNER JOIN ' . prefixTable('roles_title') . ' as rt ON rv.role_id = rt.id
+                    WHERE rv.role_id IN %ls AND nt.personal_folder = 0
+                    ORDER BY rv.folder_id ASC',
+                    $arrData['functions']
+                );
+                foreach ($rows as $record) {
+                    $bFound = false;
+                    $x = 0;
+                    foreach ($arrFolders as $fld) {
+                        if ($fld['id'] === $record['folder_id']) {
+                            // Resolve effective permission (least permissive wins)
+                            $arrFolders[$x]['type'] = evaluateFolderAccesLevel($record['type'], $arrFolders[$x]['type']);
+                            // Accumulate all roles contributing to this folder
+                            $arrFolders[$x]['roles'][] = ['title' => $record['role_title'], 'type' => $record['type']];
+                            $bFound = true;
+                            break;
+                        }
+                        ++$x;
+                    }
+                    if ($bFound === false && in_array($record['folder_id'], $arrData['denied_folders']) === false) {
+                        array_push($arrFolders, [
+                            'id'     => $record['folder_id'],
+                            'type'   => $record['type'],
+                            'special'=> false,
+                            'roles'  => [['title' => $record['role_title'], 'type' => $record['type']]],
+                        ]);
+                    }
+                }
+
+                // add allowed folders (direct user assignment, not role-based)
+                foreach($arrData['allowed_folders'] as $Fld) {
+                    array_push($arrFolders, [
+                        'id'     => $Fld,
+                        'type'   => 'W',
+                        'special'=> true,
+                        'roles'  => [],
+                    ]);
+                }
+                
+                $tree_desc = $tree->getDescendants();
+                foreach ($tree_desc as $t) {
+                    if ((int) $t->personal_folder === 1 && $t->title !== $rowUser['id']) {
+                        // skip personal folders
+                        continue;
+                    }
+                    foreach ($arrFolders as $fld) {
+                        if ($fld['id'] === $t->id) {
+                            // get folder name
+                            $row = DB::queryFirstRow(
+                                'SELECT title, nlevel, id
+                                FROM ' . prefixTable('nested_tree') . '
+                                WHERE id = %i',
+                                $fld['id']
+                            );
+
+                            $foldersData[] = [
+                                'id'     => $row['id'],
+                                'title'  => $row['title'],
+                                'nlevel' => $row['nlevel'],
+                                'type'   => $fld['type'],
+                                'special'=> $fld['special'],
+                                'roles'  => $fld['roles'],
+                            ];
+
+                            break;
+                        }
+                    }
+                }
+
+                $html_full = '<table id="table-folders" class="table table-bordered table-striped dt-responsive nowrap" style="width:100%"><tbody>' .
+                    $html . '</tbody></table>';
+            } else {
+                $html_full = '';
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'folders' => $foldersData,
+                    'user' => [
+                        'login' => $rowUser['login'],
+                        'name' => $rowUser['name'],
+                        'lastname' => $rowUser['lastname']
+                    ],
+                    'error' => false,
+                    'message' => '',
+                ),
+                'encode'
+            );
+            break;
+
+        /*
+        * GET LIST OF USERS
+        */
+        case 'get_list_of_users_for_sharing':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $arrUsers = [];
+
+            // Requête adaptée avec les nouvelles tables relationnelles
+            if ((int) $session->get('user-admin') === 0 && (int) $session->get('user-can_manage_all_users') === 0) {
+                // Use subqueries for aggregations (MySQL ONLY_FULL_GROUP_BY compatibility)
+            $rows = DB::query(
+                    'SELECT u.*,
+                    agg_roles.fonction_id,
+                    agg_groups.groupes_visibles,
+                    agg_gforbid.groupes_interdits
+                    FROM ' . prefixTable('users') . ' AS u
+                    LEFT JOIN (
+                        SELECT user_id,
+                            GROUP_CONCAT(DISTINCT CASE WHEN source = "manual" THEN role_id END ORDER BY role_id SEPARATOR ";") AS fonction_id
+                        FROM ' . prefixTable('users_roles') . '
+                        GROUP BY user_id
+                    ) agg_roles ON agg_roles.user_id = u.id
+                    LEFT JOIN (
+                        SELECT user_id, GROUP_CONCAT(group_id ORDER BY group_id SEPARATOR ";") AS groupes_visibles
+                        FROM ' . prefixTable('users_groups') . '
+                        GROUP BY user_id
+                    ) agg_groups ON agg_groups.user_id = u.id
+                    LEFT JOIN (
+                        SELECT user_id, GROUP_CONCAT(group_id ORDER BY group_id SEPARATOR ";") AS groupes_interdits
+                        FROM ' . prefixTable('users_groups_forbidden') . '
+                        GROUP BY user_id
+                    ) agg_gforbid ON agg_gforbid.user_id = u.id
+                    WHERE u.admin = %i AND u.isAdministratedByRole IN %ls AND u.deleted_at IS NULL AND u.disabled = %i',
+                    0,
+                    array_filter($session->get('user-roles_array')),
+                    0
+                );
+            } else {
+                $rows = DB::query(
+                    'SELECT u.*,
+                    agg_roles.fonction_id,
+                    agg_groups.groupes_visibles,
+                    agg_gforbid.groupes_interdits
+                    FROM ' . prefixTable('users') . ' AS u
+                    LEFT JOIN (
+                        SELECT user_id,
+                            GROUP_CONCAT(DISTINCT CASE WHEN source = "manual" THEN role_id END ORDER BY role_id SEPARATOR ";") AS fonction_id
+                        FROM ' . prefixTable('users_roles') . '
+                        GROUP BY user_id
+                    ) agg_roles ON agg_roles.user_id = u.id
+                    LEFT JOIN (
+                        SELECT user_id, GROUP_CONCAT(group_id ORDER BY group_id SEPARATOR ";") AS groupes_visibles
+                        FROM ' . prefixTable('users_groups') . '
+                        GROUP BY user_id
+                    ) agg_groups ON agg_groups.user_id = u.id
+                    LEFT JOIN (
+                        SELECT user_id, GROUP_CONCAT(group_id ORDER BY group_id SEPARATOR ";") AS groupes_interdits
+                        FROM ' . prefixTable('users_groups_forbidden') . '
+                        GROUP BY user_id
+                    ) agg_gforbid ON agg_gforbid.user_id = u.id
+                    WHERE u.admin = %i AND u.deleted_at IS NULL AND u.disabled = %i',
+                    0,
+                    0
+                );
+            }
+
+            foreach ($rows as $record) {
+                // Assurer que les champs sont des chaînes vides si NULL
+                $record['fonction_id'] = $record['fonction_id'] ?? '';
+                $record['groupes_visibles'] = $record['groupes_visibles'] ?? '';
+                $record['groupes_interdits'] = $record['groupes_interdits'] ?? '';
+                
+                // Get roles
+                $groups = [];
+                $groupIds = [];
+                if (!empty($record['fonction_id'])) {
+                    foreach (explode(';', $record['fonction_id']) as $group) {
+                        if (!empty($group)) {
+                            $tmp = DB::queryFirstRow(
+                                'SELECT id, title FROM ' . prefixTable('roles_title') . '
+                                WHERE id = %i',
+                                $group
+                            );
+                            if ($tmp !== null) {
+                                array_push($groups, $tmp['title']);
+                                array_push($groupIds, $tmp['id']);
+                            }
+                        }
+                    }
+                }
+
+                // Get managed_by
+                $managedBy = DB::queryFirstRow(
+                    'SELECT id, title FROM ' . prefixTable('roles_title') . '
+                    WHERE id = %i',
+                    $record['isAdministratedByRole']
+                );
+
+                // Get Allowed folders
+                $foldersAllowed = [];
+                $foldersAllowedIds = [];
+                if (!empty($record['groupes_visibles'])) {
+                    foreach (explode(';', $record['groupes_visibles']) as $role) {
+                        if (!empty($role)) {
+                            $tmp = DB::queryFirstRow(
+                                'SELECT id, title FROM ' . prefixTable('nested_tree') . '
+                                WHERE id = %i',
+                                $role
+                            );
+                            array_push($foldersAllowed, $tmp !== null ? $tmp['title'] : $lang->get('none'));
+                            array_push($foldersAllowedIds, $tmp !== null ? $tmp['id'] : -1);
+                        }
+                    }
+                }
+
+                // Get denied folders
+                $foldersForbidden = [];
+                $foldersForbiddenIds = [];
+                if (!empty($record['groupes_interdits'])) {
+                    foreach (explode(';', $record['groupes_interdits']) as $role) {
+                        if (!empty($role)) {
+                            $tmp = DB::queryFirstRow(
+                                'SELECT id, title FROM ' . prefixTable('nested_tree') . '
+                                WHERE id = %i',
+                                $role
+                            );
+                            array_push($foldersForbidden, $tmp !== null ? $tmp['title'] : $lang->get('none'));
+                            array_push($foldersForbiddenIds, $tmp !== null ? $tmp['id'] : -1);
+                        }
+                    }
+                }
+
+                // Store
+                array_push(
+                    $arrUsers,
+                    array(
+                        'id' => $record['id'],
+                        'name' => $record['name'],
+                        'lastname' => $record['lastname'],
+                        'login' => $record['login'],
+                        'groups' => implode(', ', $groups),
+                        'groupIds' => $groupIds,
+                        'managedBy' => $managedBy === null ? $lang->get('administrator') : $managedBy['title'],
+                        'managedById' => $managedBy === null ? 0 : $managedBy['id'],
+                        'foldersAllowed' => implode(', ', $foldersAllowed),
+                        'foldersAllowedIds' => $foldersAllowedIds,
+                        'foldersForbidden' => implode(', ', $foldersForbidden),
+                        'foldersForbiddenIds' => $foldersForbiddenIds,
+                        'admin' => $record['admin'],
+                        'manager' => $record['gestionnaire'],
+                        'hr' => $record['can_manage_all_users'],
+                        'readOnly' => $record['read_only'],
+                        'personalFolder' => $record['personal_folder'],
+                        'rootFolder' => $record['can_create_root_folder'],
+                    )
+                );
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'values' => $arrUsers,
+                ),
+                'encode'
+            );
+
+            break;
+
+
+        /*
+        * UPDATE USERS RIGHTS BY SHARING
+        */
+        case 'update_users_rights_sharing':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $data = [
+                'source_id' => isset($dataReceived['source_id']) === true ? $dataReceived['source_id'] : 0,
+                'destination_ids' => isset($dataReceived['destination_ids']) === true ? $dataReceived['destination_ids'] : 0,
+                'user_functions' => isset($dataReceived['user_functions']) === true ? $dataReceived['user_functions'] : '',
+                'user_managedby' => isset($dataReceived['user_managedby']) === true ? $dataReceived['user_managedby'] : '',
+                'user_fldallowed' => isset($dataReceived['user_fldallowed']) === true ? $dataReceived['user_fldallowed'] : '',
+                'user_fldforbid' => isset($dataReceived['user_fldforbid']) === true ? $dataReceived['user_fldforbid'] : '',
+                'user_admin' => isset($dataReceived['user_admin']) === true ? $dataReceived['user_admin'] : 0,
+                'user_manager' => isset($dataReceived['user_manager']) === true ? $dataReceived['user_manager'] : 0,
+                'user_hr' => isset($dataReceived['user_hr']) === true ? $dataReceived['user_hr'] : 0,
+                'user_readonly' => isset($dataReceived['user_readonly']) === true ? $dataReceived['user_readonly'] : 1,
+                'user_personalfolder' => isset($dataReceived['user_personalfolder']) === true ? $dataReceived['user_personalfolder'] : 0,
+                'user_rootfolder' => isset($dataReceived['user_rootfolder']) === true ? $dataReceived['user_rootfolder'] : 0,
+            ];
+            
+            $filters = [
+                'source_id' => 'cast:integer',
+                'destination_ids' => 'trim|escape',
+                'user_functions' => 'trim|escape',
+                'user_managedby' => 'trim|escape',
+                'user_fldallowed' => 'trim|escape',
+                'user_fldforbid' => 'trim|escape',
+                'user_admin' => 'cast:integer',
+                'user_manager' => 'cast:integer',
+                'user_hr' => 'cast:integer',
+                'user_readonly' => 'cast:integer',
+                'user_personalfolder' => 'cast:integer',
+                'user_rootfolder' => 'cast:integer',
+            ];
+            
+            $inputData = dataSanitizer(
+                $data,
+                $filters
+            );
+
+            // Check send values
+            if ($inputData['source_id'] === 0
+                || $inputData['destination_ids'] === 0
+                || is_array($inputData['destination_ids']) === false) {
+                // error
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // SECURITY (GHSA-58ph-5gg6-h2v8, adjacent finding): this action designates its targets
+            // through 'destination_ids', not 'user_id', so the manager/admin target-scope guard
+            // applied at the top of this file never fires here. The checks used to validate the
+            // *source* account only -- the destinations were never verified, and the test repeated
+            // inside the loop simply re-read the same source row -- which let a manager write the
+            // privilege columns of any account, including their own.
+
+            // Only an administrator may grant privileged flags. A legitimate propagation never
+            // carries them: get_list_of_users_for_sharing only ever offers non-admin accounts.
+            if ((int) $session->get('user-admin') !== 1
+                && ((int) $inputData['user_admin'] === 1
+                    || (int) $inputData['user_hr'] === 1
+                    || (int) $inputData['user_manager'] === 1)) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // The caller must be entitled to administrate the source account and every single
+            // destination. They are all checked before anything is written, so a refused entry
+            // cannot leave a partially applied propagation behind.
+            foreach (array_merge([$inputData['source_id']], $inputData['destination_ids']) as $userToCheck) {
+                if (callerMayManageUser((int) $userToCheck) === false) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('error_not_allowed_to'),
+                        ),
+                        'encode'
+                    );
+                    break 2;
+                }
+            }
+
+            foreach ($inputData['destination_ids'] as $dest_user_id) {
+                // Update user roles in users_roles table
+                $roleIds = array_filter(
+                    explode(';', str_replace(',', ';', (string) $inputData['user_functions']))
+                );
+                setUserRoles((int) $dest_user_id, $roleIds, 'manual');
+
+                // Update allowed folders in users_groups table
+                $allowedFolders = array_filter(
+                    explode(';', str_replace(',', ';', (string) $inputData['user_fldallowed']))
+                );
+                setUserGroups((int) $dest_user_id, $allowedFolders);
+
+                // Update forbidden folders in users_groups_forbidden table
+                $forbiddenFolders = array_filter(
+                    explode(';', str_replace(',', ';', (string) $inputData['user_fldforbid']))
+                );
+                setUserForbiddenGroups((int) $dest_user_id, $forbiddenFolders);
+
+                // Update other user fields in users table
+                DB::update(
+                    prefixTable('users'),
+                    array(
+                        'isAdministratedByRole' => $inputData['user_managedby'],
+                        'gestionnaire' => $inputData['user_manager'],
+                        'read_only' => $inputData['user_readonly'],
+                        'can_create_root_folder' => $inputData['user_rootfolder'],
+                        'personal_folder' => $inputData['user_personalfolder'],
+                        'can_manage_all_users' => $inputData['user_hr'],
+                        'admin' => $inputData['user_admin'],
+                    ),
+                    'id = %i',
+                    $dest_user_id
+                );
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                ),
+                'encode'
+            );
+
+            break;
+
+
+            /*
+         * UPDATE USER PROFILE
+         */
+        case 'user_profile_update':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Check user
+            if (
+                null === $session->get('user-id')
+                || empty($session->get('user-id')) === true
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('no_user'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (empty($dataReceived) === false) {
+                // Sanitize
+                $data = [
+                    'email' => isset($dataReceived['email']) === true ? $dataReceived['email'] : '',
+                    'timezone' => isset($dataReceived['timezone']) === true ? $dataReceived['timezone'] : '',
+                    'language' => isset($dataReceived['language']) === true ? $dataReceived['language'] : '',
+                    'treeloadstrategy' => isset($dataReceived['treeloadstrategy']) === true ? $dataReceived['treeloadstrategy'] : null,
+                    'agsescardid' => isset($dataReceived['agsescardid']) === true ? $dataReceived['agsescardid'] : '',
+                    'name' => isset($dataReceived['name']) === true ? $dataReceived['name'] : '',
+                    'lastname' => isset($dataReceived['lastname']) === true ? $dataReceived['lastname'] : '',
+                    'split_view_mode' => isset($dataReceived['split_view_mode']) === true ? $dataReceived['split_view_mode'] : '',
+                    'show_subfolders' => isset($dataReceived['show_subfolders']) === true ? $dataReceived['show_subfolders'] : '',
+                ];
+                
+                $filters = [
+                    'email' => 'trim|escape',
+                    'timezone' => 'trim|escape',
+                    'language' => 'trim|escape',
+                    'treeloadstrategy' => 'trim|escape',
+                    'agsescardid' => 'trim|escape',
+                    'name' => 'trim|escape',
+                    'lastname' => 'trim|escape',
+                    'split_view_mode' => 'cast:integer',
+                    'show_subfolders' => 'cast:integer',
+                ];
+                
+                $inputData = dataSanitizer(
+                    $data,
+                    (array) $filters
+                );
+
+                // Prevent LFI.
+                $inputData['language'] = preg_replace('/[^a-z_]/', "", $inputData['language']);
+
+                // Force english if non-existent language.
+                if (!file_exists(__DIR__."/../includes/language/".$inputData['language'].".php")) {
+                    $inputData['language'] = 'english';
+                }
+
+                $currentTreeLoadStrategy = (string) ($session->get('user-tree_load_strategy') ?? 'full');
+                if ($currentTreeLoadStrategy === '') {
+                    $currentTreeLoadStrategy = 'full';
+                }
+
+                $requestedTreeLoadStrategy = isset($inputData['treeloadstrategy']) === true
+                    ? trim((string) $inputData['treeloadstrategy'])
+                    : '';
+                if ($requestedTreeLoadStrategy === '') {
+                    $requestedTreeLoadStrategy = $currentTreeLoadStrategy;
+                }
+                if (in_array($requestedTreeLoadStrategy, ['full', 'sequential'], true) === false) {
+                    $requestedTreeLoadStrategy = $currentTreeLoadStrategy;
+                }
+
+                // Data to update
+                $update_fields = [
+                    'split_view_mode' => $inputData['split_view_mode'],
+                    'show_subfolders' => $inputData['show_subfolders'],
+                ];
+
+                // Update SETTINGS
+                $session->set('user-split_view_mode', (int) $inputData['split_view_mode']);
+                $session->set('user-show_subfolders', (int) $inputData['show_subfolders']);
+
+                // User profile edit enabled
+                if (($SETTINGS['disable_user_edit_profile'] ?? '0') === '0') {
+                    // Update database
+                    $update_fields['email']    = $inputData['email'];
+                    $update_fields['name']     = $inputData['name'];
+                    $update_fields['lastname'] = $inputData['lastname'];
+                    // Update session
+                    $session->set('user-email', $inputData['email']);
+                    $session->set('user-name', $inputData['name']);
+                    $session->set('user-lastname', $inputData['lastname']);    
+                }
+
+                // User language edit enabled
+                if (($SETTINGS['disable_user_edit_language'] ?? '0') === '0') {
+                    // Update database
+                    $update_fields['user_language'] = $inputData['language'];
+                    // Update session
+                    $session->set('user-language', $inputData['language']);
+                }
+
+                // User timezone edit enabled
+                if (($SETTINGS['disable_user_edit_timezone'] ?? '0') === '0') {
+                    // Update database
+                    $update_fields['usertimezone'] = $inputData['timezone'];
+                    // Update session
+                    $session->set('user-timezone', $inputData['timezone']);
+                }
+
+                // User can edit tree load strategy
+                if (($SETTINGS['disable_user_edit_tree_load_strategy'] ?? '0') === '0') {
+                    // Update database
+                    $update_fields['treeloadstrategy'] = $requestedTreeLoadStrategy;
+                    // Update session
+                    $session->set('user-tree_load_strategy', $requestedTreeLoadStrategy);
+                }
+
+                // update user
+                DB::update(
+                    prefixTable('users'),
+                    $update_fields,
+                    'id = %i',
+                    $session->get('user-id')
+                );
+
+            } else {
+                // An error appears on JSON format
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('json_error_format'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Encrypt data to return
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'message' => '',
+                    'name' => $session->get('user-name'),
+                    'lastname' => $session->get('user-lastname'),
+                    'email' => $session->get('user-email'),
+                    'language' => $session->get('user-language'),
+                    'timezone' => $session->get('user-timezone'),
+                    'treeloadstrategy' => $session->get('user-tree_load_strategy'),
+                    'split_view_mode' => $session->get('user-split_view_mode'),
+                    'show_subfolders' => $session->get('user-show_subfolders'),
+                ),
+                'encode'
+            );
+            break;
+
+        /*
+         * DELETE CURRENT USER AVATAR
+         */
+        case 'user_profile_avatar_delete':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (
+                null === $session->get('user-id')
+                || empty($session->get('user-id')) === true
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('no_user'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if ((string) ($SETTINGS['disable_user_edit_profile'] ?? '0') !== '0') {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $avatarData = DB::queryFirstRow(
+                'SELECT avatar, avatar_thumb FROM ' . prefixTable('users') . ' WHERE id = %i',
+                $session->get('user-id')
+            );
+
+            if (is_array($avatarData) === true) {
+                $avatarDir = TEAMPASS_ROOT . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . 'assets' . DIRECTORY_SEPARATOR . 'avatars';
+                foreach (['avatar', 'avatar_thumb'] as $avatarColumn) {
+                    $avatarFile = basename(trim((string) ($avatarData[$avatarColumn] ?? '')));
+                    if ($avatarFile !== '') {
+                        fileDelete($avatarDir . DIRECTORY_SEPARATOR . $avatarFile, $SETTINGS);
+                    }
+                }
+            }
+
+            DB::update(
+                prefixTable('users'),
+                [
+                    'avatar' => '',
+                    'avatar_thumb' => '',
+                ],
+                'id = %i',
+                $session->get('user-id')
+            );
+
+            $session->set('user-avatar', '');
+            $session->set('user-avatar_thumb', '');
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'message' => $lang->get('avatar_deleted'),
+                    'avatar_url' => './assets/images/photo.jpg',
+                ),
+                'encode'
+            );
+            break;
+
+            //CASE where refreshing table
+        case 'save_user_change':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // prepare variables
+            $post_user_id = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+            $post_field = filter_var($dataReceived['field'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_new_value = filter_var($dataReceived['value'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_context = filter_var($dataReceived['context'] ?? '', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+
+            // SECURITY (GHSA-x8jf-9g87-j232): this action is listed in $all_users_can_access and
+            // therefore skips the manager/admin target-scope guard applied to other actions. Each
+            // sub-path below that writes a user record must consequently enforce, on its own, that
+            // the caller is entitled to modify $post_user_id. The closure returns true for an
+            // administrator, and for a manager acting within their scope on a non-privileged target;
+            // false for everyone else. The self-service api-key path is intentionally exempt (a user
+            // may always regenerate their own API key, and it is scoped to self above).
+            $callerIsAdmin = (int) $session->get('user-admin') === 1;
+            $callerMayManageTargetUser = static function (int $targetUserId) use ($session, $callerIsAdmin): bool {
+                if ($callerIsAdmin === true) {
+                    return true;
+                }
+                // Standard users may never manage a user record through this action.
+                if ((int) $session->get('user-manager') !== 1
+                    && (int) $session->get('user-can_manage_all_users') !== 1) {
+                    return false;
+                }
+                $target = DB::queryFirstRow(
+                    'SELECT admin, gestionnaire, can_manage_all_users, isAdministratedByRole
+                    FROM ' . prefixTable('users') . '
+                    WHERE id = %i',
+                    $targetUserId
+                );
+                // Unknown target, or a manager attempting to act on an administrator or another
+                // manager, is always refused.
+                if (DB::count() === 0
+                    || (int) $target['admin'] === 1
+                    || (int) $target['can_manage_all_users'] === 1
+                    || (int) $target['gestionnaire'] === 1) {
+                    return false;
+                }
+                // A plain manager is limited to users administrated by one of their own roles.
+                if ((int) $session->get('user-manager') === 1
+                    && in_array($target['isAdministratedByRole'], $session->get('user-roles_array')) === false) {
+                    return false;
+                }
+                return true;
+            };
+
+            // SECURITY (GHSA-gjc5-pmxw-58p4): the role id is client-supplied, so being entitled to
+            // manage the target user is not enough — the caller must also be entitled to grant that
+            // particular role, otherwise a manager could hand one of their users a role reaching
+            // folders the manager cannot see. The scope mirrors the role dropdown built server-side
+            // in app/pages/users.php: an administrator may grant any existing role, anyone else only
+            // a role they hold themselves or a role they created.
+            $callerMayGrantRole = static function (int $roleId) use ($session, $callerIsAdmin): bool {
+                $role = DB::queryFirstRow(
+                    'SELECT creator_id
+                    FROM ' . prefixTable('roles_title') . '
+                    WHERE id = %i',
+                    $roleId
+                );
+                // A role id pointing to nothing is never granted.
+                if (DB::count() === 0 || is_array($role) === false) {
+                    return false;
+                }
+                if ($callerIsAdmin === true) {
+                    return true;
+                }
+                // user-roles_array holds the caller's effective roles (manual ones plus those
+                // derived from AD groups), stored as strings at login.
+                $callerRoles = array_map('strval', (array) $session->get('user-roles_array'));
+                return in_array((string) $roleId, $callerRoles, true)
+                    || (int) $role['creator_id'] === (int) $session->get('user-id');
+            };
+
+            // If adding a role to user, use the users_roles table directly
+            if (empty($post_context) === false && $post_context === 'add_one_role_to_user') {
+                // Only an administrator or an in-scope manager may assign a role to this user,
+                // and only a role that is within their own grant scope.
+                if ($callerMayManageTargetUser((int) $post_user_id) === false
+                    || $callerMayGrantRole((int) $post_new_value) === false
+                ) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('error_not_allowed_to'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+
+                // Check if user exists
+                $data_user = DB::queryFirstRow(
+                    'SELECT id FROM ' . prefixTable('users') . ' WHERE id = %i',
+                    $post_user_id
+                );
+
+                if ($data_user) {
+                    // Add the role using the dedicated function (INSERT IGNORE prevents duplicates)
+                    addUserRole((int) $post_user_id, (int) $post_new_value, 'manual');
+
+                    // Send success response
+                    echo prepareExchangedData(
+                        array(
+                            'error' => false,
+                            'message' => ''
+                        ),
+                        'encode'
+                    );
+                    break;
+                } else {
+                    // User not found
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('user_not_exists'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+            }
+
+            // Manage specific case of api key
+            if($post_field === 'user_api_key') {
+                // SECURITY (GHSA-8mvg-rv84-jwgg / GHSA-x8jf-9g87-j232): regenerating the personal API
+                // key is strictly a self-service operation — the new value is encrypted with the
+                // caller's own public key and stored in the caller's own session. The target row must
+                // therefore always be the caller's own record, never an attacker-supplied user_id.
+                // Standard users already have user_id forced to self earlier, but this action is in
+                // $all_users_can_access and a manager/admin bypasses that force, so pin the target
+                // here to close a cross-user overwrite of another account's api row.
+                $apiKeyOwnerId = (int) $session->get('user-id');
+                $encrypted_key = encryptUserObjectKey(base64_encode($post_new_value), $session->get('user-public_key'));
+                $session->set('user-api_key', $post_new_value);
+
+                // test if user has an api key
+                $data_user = DB::queryFirstRow(
+                    'SELECT value
+                    FROM ' . prefixTable('api') . '
+                    WHERE user_id = %i',
+                    $apiKeyOwnerId
+                );
+                if ($data_user) {
+                    // update
+                    DB::update(
+                        prefixTable('api'),
+                        array(
+                            'value' => $encrypted_key,
+                            'timestamp' => time()
+                        ),
+                        'user_id = %i',
+                        $apiKeyOwnerId
+                    );
+                } else {
+                    // insert
+                    DB::insert(
+                        prefixTable('api'),
+                        array(
+                            'type' => 'user',
+                            'user_id' => $apiKeyOwnerId,
+                            'value' => $encrypted_key,
+                            'timestamp' => time()
+                        )
+                    );
+                }
+
+                // send data
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'message' => ''
+                    ),
+                    'encode'
+                );
+
+                break;
+            }
+
+            // SECURITY (GHSA-x8jf-9g87-j232): the column name below comes from the request. Restrict
+            // it to an explicit allow-list of non-privileged fields so it can never be used to write
+            // admin, gestionnaire, can_manage_all_users, read_only, pw, private_key, api_key, ... and
+            // confirm the caller is entitled to modify this specific user.
+            // 'fonction_id' is deliberately absent: the column was dropped from the users table in
+            // 3.1.5 (roles now live in users_roles), so this generic path can no longer write roles.
+            // Keeping it listed would leave a role write that bypasses the grant-scope check above.
+            $writableUserFields = ['login', 'name', 'lastname', 'isAdministratedByRole', 'auth_type'];
+            if (in_array($post_field, $writableUserFields, true) === false
+                || $callerMayManageTargetUser((int) $post_user_id) === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            DB::update(
+                prefixTable('users'),
+                array(
+                    $post_field => $post_new_value,
+                ),
+                'id = %i',
+                $post_user_id
+            );
+
+            // special case
+            if ($post_field === 'auth_type' && $post_new_value === 'ldap') {
+                /*DB::update(
+                    prefixTable('users'),
+                    array(
+                        'special' => 'recrypt-private-key',
+                    ),
+                    'id = %i',
+                    $post_user_id
+                );*/
+            }
+
+            // send data
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'message' => ''
+                ),
+                'encode'
+            );
+
+            break;
+
+        /*
+        * GET LDAP LIST OF USERS
+        */
+        case 'get_list_of_users_in_ldap':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            
+            // Build ldap configuration array
+            $config = [
+                // Mandatory Configuration Options
+                'hosts'            => explode(',', (string) $SETTINGS['ldap_hosts']),
+                'base_dn'          => $SETTINGS['ldap_bdn'],
+                'username'         => $SETTINGS['ldap_username'],
+                'password'         => $SETTINGS['ldap_password'],
+            
+                // Optional Configuration Options
+                'port'             => $SETTINGS['ldap_port'],
+                'use_ssl'          => (int) $SETTINGS['ldap_ssl'] === 1 ? true : false,
+                'use_tls'          => (int) $SETTINGS['ldap_tls'] === 1 ? true : false,
+                'version'          => 3,
+                'timeout'          => 5,
+                'follow_referrals' => false,
+            
+                // Custom LDAP Options
+                'options' => [
+                    // See: http://php.net/ldap_set_option
+                    LDAP_OPT_X_TLS_REQUIRE_CERT => isset($SETTINGS['ldap_tls_certificate_check']) === false ? 'LDAP_OPT_X_TLS_NEVER' : $SETTINGS['ldap_tls_certificate_check'],
+                ]
+            ];
+            //prepare connection
+            $connection = new Connection($config);
+
+            // Connect to LDAP
+            try {
+                $connection->connect();
+            
+            } catch (\LdapRecord\Auth\BindException $e) {
+                $error = $e->getDetailedError();
+                if ($error && defined('LOG_TO_SERVER') && LOG_TO_SERVER === true) {
+                    error_log('TEAMPASS Error - LDAP - '.$error->getErrorCode()." - ".$error->getErrorMessage(). " - ".$error->getDiagnosticMessage());
+                }
+                // deepcode ignore ServerLeak: No important data is sent and it is encrypted before sending
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => "An error occurred.",
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $adUsersToSync = array();
+            $adRoles = array();
+            $usersAlreadyInTeampass = array();
+
+            // Retrieve LDAP groups via a separate query based on LDAP server type
+            // This is necessary because OpenLDAP does not have 'memberof' attribute by default
+            // Also build a reverse mapping: user (uid or dn) -> list of groups
+            $userGroupsMap = [];
+            try {
+                if (isset($SETTINGS['ldap_type']) === true && $SETTINGS['ldap_type'] === 'OpenLDAP') {
+                    $ldapGroupExtra = new OpenLdapExtra();
+                } elseif (isset($SETTINGS['ldap_type']) === true && $SETTINGS['ldap_type'] === 'ActiveDirectory') {
+                    $ldapGroupExtra = new ActiveDirectoryExtra();
+                } else {
+                    // Default to OpenLDAP for other types (FreeIPA, etc.)
+                    $ldapGroupExtra = new OpenLdapExtra();
+                }
+
+                $groupsData = $ldapGroupExtra->getADGroups($connection, $SETTINGS);
+
+                if ($groupsData['error'] === false && isset($groupsData['userGroups']) === true) {
+                    foreach ($groupsData['userGroups'] as $groupId => $group) {
+                        $groupTitle = $group['ad_group_title'] ?? '';
+                        if (empty($groupTitle)) continue;
+
+                        // Add to global groups list
+                        if (!in_array($groupTitle, $adRoles)) {
+                            $adRoles[] = $groupTitle;
+                        }
+
+                        // Map each member to this group for reverse lookup
+                        if (isset($group['members']) === true) {
+                            foreach ($group['members'] as $member) {
+                                $memberKey = strtolower($member['value']);
+                                if (!isset($userGroupsMap[$memberKey])) {
+                                    $userGroupsMap[$memberKey] = [];
+                                }
+                                if (!in_array($groupTitle, $userGroupsMap[$memberKey])) {
+                                    $userGroupsMap[$memberKey][] = $groupTitle;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (\Exception $e) {
+                // Log the error but continue - groups will remain empty
+                if (defined('LOG_TO_SERVER') && LOG_TO_SERVER === true) {                                       
+                    error_log('TEAMPASS Error - LDAP groups retrieval - ' . $e->getMessage());                  
+                }
+            } 
+            
+            // Retrieve LDAP users
+            $adUsedAttributes = array(
+                'dn', 'mail', 'givenname', 'samaccountname', 'sn', $SETTINGS['ldap_user_attribute'],
+                'memberof', 'name', 'displayname', 'cn', 'shadowexpire', 'distinguishedname', 'uid'
+            );
+
+            $adStatusAttributes = array('useraccountcontrol', 'accountexpires', 'accountExpires');
+            $adQueryAttributes = array_values(array_unique(array_merge($adUsedAttributes, $adStatusAttributes)));
+
+            try {
+                $results = $connection->query()
+                    ->select($adQueryAttributes)
+                    ->rawfilter(tpLdapBuildObjectFilter((string) $SETTINGS['ldap_user_object_filter']))
+                    ->in((empty($SETTINGS['ldap_dn_additional_user_dn']) === false ? $SETTINGS['ldap_dn_additional_user_dn'].',' : '').$SETTINGS['ldap_bdn'])
+                    ->whereHas($SETTINGS['ldap_user_attribute'])
+                    ->paginate(100);
+            } catch (\LdapRecord\Auth\BindException $e) {
+                $error = $e->getDetailedError();
+                if ($error && defined('LOG_TO_SERVER') && LOG_TO_SERVER === true) {
+                    error_log('TEAMPASS Error - LDAP - '.$error->getErrorCode()." - ".$error->getErrorMessage(). " - ".$error->getDiagnosticMessage());
+                }
+                // deepcode ignore ServerLeak: No important data is sent and it is encrypted before sending
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => "An error occurred.",
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            
+            foreach ($results as $adUser) {
+                if (isset($adUser[$SETTINGS['ldap_user_attribute']][0]) === false) continue;
+                // Build the list of all groups in AD
+                if (isset($adUser['memberof']) === true) {
+                    foreach($adUser['memberof'] as $j => $adUserGroup) {
+                        if (empty($adUserGroup) === false && $j !== "count") {
+                            $adGroup = substr($adUserGroup, 3, strpos($adUserGroup, ',') - 3);
+                            if (in_array($adGroup, $adRoles) === false && empty($adGroup) === false) {
+                                array_push($adRoles, $adGroup);
+                            }
+                        }
+                    }
+                }
+
+                // Is user in Teampass ?
+                $userLogin = $adUser[$SETTINGS['ldap_user_attribute']][0];
+                // Get his ID
+                $userInfo = getUserCompleteData($userLogin);
+                    
+                    // Get user's Teampass roles (titles) if user exists in Teampass
+                    $userTeampassRoles = [];
+                    if ($userInfo !== null && isset($userInfo['fonction_id']) && !empty($userInfo['fonction_id'])) {
+                        $roleIds = explode(';', $userInfo['fonction_id']);
+                        foreach ($roleIds as $roleId) {
+                            if (!empty($roleId)) {
+                                $roleData = DB::queryFirstRow(
+                                    'SELECT title FROM ' . prefixTable('roles_title') . ' WHERE id = %i',
+                                    (int) $roleId
+                                );
+                                if ($roleData !== null) {
+                                    $userTeampassRoles[] = $roleData['title'];
+                                }
+                            }
+                        }
+                    }
+
+                    // Loop on all user attributes
+                    $tmp = [
+                        'userInTeampass' => DB::count() > 0 ? (int) $userInfo['id'] : DB::count(),
+                        'userAuthType' => isset($userInfo['auth_type']) === true ? $userInfo['auth_type'] : 0,
+                        'userTeampassRoles' => $userTeampassRoles,
+                        // LDAP/AD status flags (null = unknown / attribute not available)
+                        'ldapAccountDisabled' => null,
+                        'ldapAccountExpired' => null,
+                        'ldapAccountExpiresAt' => null,
+                    ];                        
+                    foreach ($adUsedAttributes as $userAttribute) {
+                        if (isset($adUser[$userAttribute]) === true) {
+                            if (is_array($adUser[$userAttribute]) === true && array_key_first($adUser[$userAttribute]) !== 'count') {
+                                // Loop on all entries
+                                $tmpAttrValue = '';
+                                foreach ($adUser[$userAttribute] as $userAttributeEntry) {
+                                    if ($userAttribute === 'memberof') {
+                                        $userAttributeEntry = substr($userAttributeEntry, 3, strpos($userAttributeEntry, ',') - 3);
+                                    }
+                                    if (empty($tmpAttrValue) === true) {
+                                        $tmpAttrValue = $userAttributeEntry;
+                                    } else {
+                                        $tmpAttrValue .= ','.$userAttributeEntry;
+                                    }
+                                }
+                                $tmp[$userAttribute] = $tmpAttrValue;
+                            } else {
+                                $tmp[$userAttribute] = $adUser[$userAttribute];
+                            }
+                        }
+                    }
+                    // -------------------------------------------------------
+                    // LDAP/AD: Determine if the account is disabled
+                    // - Active Directory: userAccountControl bit 0x2 (UF_ACCOUNTDISABLE)
+                    // -------------------------------------------------------
+                    $uacRaw = null;
+                    if (isset($adUser['useraccountcontrol'][0]) === true) {
+                        $uacRaw = $adUser['useraccountcontrol'][0];
+                    } elseif (isset($adUser['userAccountControl'][0]) === true) {
+                        $uacRaw = $adUser['userAccountControl'][0];
+                    }
+                    if ($uacRaw !== null && is_numeric($uacRaw)) {
+                        $uac = (int) $uacRaw;
+                        $tmp['ldapAccountDisabled'] = (($uac & 2) === 2) ? 1 : 0;
+                    }
+
+                    // -------------------------------------------------------
+                    // LDAP/AD: Determine if the account is expired
+                    // - Active Directory: accountExpires is a Windows FILETIME
+                    //   (100ns since 1601-01-01). 0 or 9223372036854775807 = never expires.
+                    // - OpenLDAP shadowAccount: shadowExpire is days since 1970-01-01 (optional fallback).
+                    // -------------------------------------------------------
+                    $expiresRaw = null;
+                    if (isset($adUser['accountexpires'][0]) === true) {
+                        $expiresRaw = $adUser['accountexpires'][0];
+                    } elseif (isset($adUser['accountExpires'][0]) === true) {
+                        $expiresRaw = $adUser['accountExpires'][0];
+                    }
+
+                    if ($expiresRaw !== null) {
+                        $expiresRawStr = trim((string) $expiresRaw);
+
+                        // "never expires" values
+                        if ($expiresRawStr !== '' &&
+                            $expiresRawStr !== '0' &&
+                            $expiresRawStr !== '9223372036854775807' &&
+                            $expiresRawStr !== '18446744073709551615'
+                        ) {
+                            if (is_numeric($expiresRawStr)) {
+                                $filetime = (int) $expiresRawStr;
+                                if ($filetime > 0) {
+                                    // FILETIME -> Unix seconds
+                                    $unix = (int) (intdiv($filetime, 10000000) - 11644473600);
+                                    $tmp['ldapAccountExpiresAt'] = $unix;
+                                    $tmp['ldapAccountExpired'] = ($unix <= time()) ? 1 : 0;
+                                }
+                            }
+                        } else {
+                            $tmp['ldapAccountExpired'] = 0;
+                            $tmp['ldapAccountExpiresAt'] = null;
+                        }
+                    } elseif (isset($adUser['shadowexpire'][0]) === true && is_numeric($adUser['shadowexpire'][0])) {
+                        // Fallback for shadowAccount directories (days since epoch)
+                        $shadowDays = (int) $adUser['shadowexpire'][0];
+                        if ($shadowDays > 0) {
+                            $unix = $shadowDays * 86400;
+                            $tmp['ldapAccountExpiresAt'] = $unix;
+                            $tmp['ldapAccountExpired'] = ($unix <= time()) ? 1 : 0;
+                        } else {
+                            $tmp['ldapAccountExpired'] = 0;
+                        }
+                    }
+
+                    // Retrieve user's groups from the reverse mapping built earlier
+                    // For posixGroup, memberUid typically references the 'uid' attribute of users
+                    $userGroups = [];
+                    $userDN = strtolower($adUser['dn'] ?? '');
+                    $userLoginAttr = strtolower($adUser[$SETTINGS['ldap_user_attribute']][0] ?? '');
+                    $userCN = strtolower($adUser['cn'][0] ?? '');
+                    $userUID = strtolower($adUser['uid'][0] ?? '');
+
+                    // Search by DN (for groupOfNames/groupOfUniqueNames)
+                    if (!empty($userDN) && isset($userGroupsMap[$userDN])) {
+                        $userGroups = array_merge($userGroups, $userGroupsMap[$userDN]);
+                    }
+                    // Search by uid attribute (for posixGroup memberUid)
+                    if (!empty($userUID) && isset($userGroupsMap[$userUID])) {
+                        $userGroups = array_merge($userGroups, $userGroupsMap[$userUID]);
+                    }
+                    // Search by login attribute
+                    if (!empty($userLoginAttr) && $userLoginAttr !== $userUID && isset($userGroupsMap[$userLoginAttr])) {
+                        $userGroups = array_merge($userGroups, $userGroupsMap[$userLoginAttr]);
+                    }
+                    // Search by CN if different
+                    if (!empty($userCN) && $userCN !== $userUID && $userCN !== $userLoginAttr && isset($userGroupsMap[$userCN])) {
+                        $userGroups = array_merge($userGroups, $userGroupsMap[$userCN]);
+                    }
+
+                    $tmp['ldap_user_groups'] = array_values(array_unique($userGroups));
+
+                    array_push($adUsersToSync, $tmp);
+            }
+
+            // Get all groups in Teampass
+            $teampassRoles = array();
+            $rows = DB::query('SELECT id,title FROM ' . prefixTable('roles_title'));
+            foreach ($rows as $record) {
+                array_push(
+                    $teampassRoles,
+                    array(
+                        'id' => $record['id'],
+                        'title' => $record['title']
+                    )
+                );
+            }
+
+            echo (string) prepareExchangedData(
+                array(
+                    'error' => false,
+                    'entries' => $adUsersToSync,
+                    'ldap_groups' => $adRoles,
+                    'teampass_groups' => $teampassRoles,
+                    'usersAlreadyInTeampass' => $usersAlreadyInTeampass,
+                ), 
+                'encode'
+            );
+
+            break;
+
+        /*
+         * ADD USER FROM LDAP OR OAUTH2
+         */
+        /*
+        * GET LDAP STATUS FOR A LIST OF TEAMPASS USER IDS (for main users list)
+        */
+        case 'get_ldap_status_for_user_ids':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Check rights
+            if ($session->get('user-admin') !== 1 && $session->get('user-can_manage_all_users') !== 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // LDAP enabled?
+            if (isset($SETTINGS['ldap_mode']) === false || (int) $SETTINGS['ldap_mode'] !== 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'statuses' => array(),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $userIds = isset($dataReceived['user_ids']) && is_array($dataReceived['user_ids'])
+                ? array_values(array_unique(array_map('intval', $dataReceived['user_ids'])))
+                : array();
+
+            if (empty($userIds)) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => false,
+                        'statuses' => array(),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            echo prepareExchangedData(
+                getLdapStatusForUserIds($userIds, $SETTINGS),
+                'encode'
+            );
+
+            break;
+
+
+        case 'add_user_from_ad':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_login = filter_var($dataReceived['login'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_name = filter_var($dataReceived['name'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_lastname = filter_var($dataReceived['lastname'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+            $post_email = filter_var($dataReceived['email'], FILTER_SANITIZE_EMAIL);
+            $post_roles = filter_var_array(
+                $dataReceived['roles'],
+                FILTER_SANITIZE_NUMBER_INT
+            );
+            $post_authType = filter_var($dataReceived['authType'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+
+            // Empty user
+            if (empty($post_login) === true || empty($post_email) === true) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_must_have_login_and_email'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            // Check if user already exists
+            $data = DB::query(
+                'SELECT id
+                FROM ' . prefixTable('users') . '
+                WHERE login = %s',
+                $post_login
+            );
+
+            if (DB::count() === 0) {
+                // check if admin role is set. If yes then check if originator is allowed
+                if ((int) $session->get('user-admin') !== 1 && (int) $session->get('user-manager') !== 1) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('error_empty_data'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+
+                // load password library
+                $passwordManager = new PasswordManager();
+
+                // Prepare variables
+                $password = generateQuickPassword(12, true);
+                $hashedPassword = $passwordManager->hashPassword($password);
+                if ($passwordManager->verifyPassword($hashedPassword, $password) === false) {
+                    echo prepareExchangedData(
+                        array(
+                            'error' => true,
+                            'message' => $lang->get('error_not_allowed_to'),
+                        ),
+                        'encode'
+                    );
+                    break;
+                }
+            } else {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_user_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            
+            // We need to create his keys with transparent recovery support
+            $userKeys = generateUserKeys($password, $SETTINGS);
+            
+            // Prepare user data for insertion
+            $userData = array(
+                'login' => $post_login,
+                'pw' => $hashedPassword,
+                'email' => $post_email,
+                'name' => $post_name,
+                'lastname' => $post_lastname,
+                'admin' => '0',
+                'gestionnaire' => '0',
+                'can_manage_all_users' => '0',
+                'personal_folder' => (int) $SETTINGS['enable_pf_feature'] === 1 ? 1 : 0,
+                'last_pw_change' => time(),
+                'user_language' => $SETTINGS['default_language'],
+                'encrypted_psk' => '',
+                'isAdministratedByRole' => (isset($SETTINGS['oauth_new_user_is_administrated_by']) === true && empty($SETTINGS['oauth_new_user_is_administrated_by']) === false) ? $SETTINGS['oauth_new_user_is_administrated_by'] : 0,
+                'public_key' => $userKeys['public_key'],
+                'private_key' => $userKeys['private_key'],
+                'special' => 'user_added_from_ad',
+                'auth_type' => $post_authType,
+                'is_ready_for_usage' => isset($SETTINGS['enable_tasks_manager']) === true && (int) $SETTINGS['enable_tasks_manager'] === 1 ? 0 : 1,
+                'created_at' => time(),
+                'personal_items_migrated' => 1,
+                'otp_provided' => 1,
+                'encryption_version' => 3,
+                'phpseclibv3_migration_completed' => 1,
+            );
+
+            // Add transparent recovery fields if available
+            if (isset($userKeys['user_seed'])) {
+                $userData['user_derivation_seed'] = $userKeys['user_seed'];
+                $userData['private_key_backup'] = $userKeys['private_key_backup'];
+                $userData['key_integrity_hash'] = $userKeys['key_integrity_hash'];
+                $userData['last_pw_change'] = time();
+            }
+
+            // Insert user in DB
+            DB::insert(
+                prefixTable('users'),
+                $userData
+            );
+            $newUserId = DB::insertId();            
+
+            // Add Groups and Roles
+            setUserRoles($newUserId, $post_roles, 'manual');
+
+            // Handle private key
+            insertPrivateKeyWithCurrentFlag(
+                $newUserId,
+                $userKeys['private_key'],        
+            );
+
+            // Create the API key
+            DB::insert(
+                prefixTable('api'),
+                array(
+                    'type' => 'user',
+                    'value' => encryptUserObjectKey(base64_encode(uniqidReal(39)), $userKeys['public_key']),
+                    'timestamp' => time(),
+                    'user_id' => $newUserId,
+                    'allowed_folders' => '',
+                )
+            );
+
+            // Create personnal folder
+            if (isset($SETTINGS['enable_pf_feature']) === true && (int) $SETTINGS['enable_pf_feature'] === 1) {
+                DB::insert(
+                    prefixTable('nested_tree'),
+                    array(
+                        'parent_id' => '0',
+                        'title' => $newUserId,
+                        'bloquer_creation' => '0',
+                        'bloquer_modification' => '0',
+                        'personal_folder' => '1',
+                        'fa_icon' => 'fas fa-folder',
+                        'fa_icon_selected' => 'fas fa-folder-open',
+                        'categories' => '',
+                    )
+                );
+
+                // Rebuild tree
+                $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+                $tree->rebuild();
+            }
+
+            // Send email to new user
+            if (isset($SETTINGS['enable_tasks_manager']) === false || (int) $SETTINGS['enable_tasks_manager'] === 0) {
+                $emailSettings = new EmailSettings($SETTINGS);
+                $emailService = new EmailService();
+                $emailService->sendMail(
+                    $lang->get('email_subject_new_user'),
+                    str_replace(
+                        array('#tp_login#', '#enc_code#', '#tp_link#'),
+                        array(addslashes($post_login), addslashes($password), $SETTINGS['email_server_url']),
+                        $lang->get('email_body_user_added_from_ldap_encryption_code')
+                    ),
+                    $post_email,
+                    $emailSettings
+                );
+            }
+            
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'message' => '',
+                    'user_id' => $newUserId,
+                    'user_code' => $password,
+                    'post_action' => isset($SETTINGS['enable_tasks_manager']) === true && (int) $SETTINGS['enable_tasks_manager'] === 1 ? 'prepare_tasks' : 'encrypt_keys',
+                ),
+                'encode'
+            );
+
+            break;
+
+        /*
+         * CHANGE USER AUTHENTICATION TYPE
+         */
+        case 'change_user_auth_type':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_id = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+            $post_auth = filter_var($dataReceived['auth_type'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+
+            // Empty user
+            if (empty($post_id) === true) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_not_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            // Check if user already exists
+            DB::query(
+                'SELECT id
+                FROM ' . prefixTable('users') . '
+                WHERE id = %i',
+                $post_id
+            );
+
+            if (DB::count() > 0) {
+                // Change authentication type in DB
+                DB::update(
+                    prefixTable('users'),
+                    array(
+                        'auth_type' => $post_auth,
+                    ),
+                    'id = %i',
+                    $post_id
+                );
+            } else {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_not_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'message' => '',
+                    'error' => false,
+                ),
+                'encode'
+            );
+
+            break;
+        
+
+        /*
+        * GET OAUTH2 LIST OF USERS
+        */
+        case 'get_list_of_users_in_oauth2':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Création d'une instance du contrôleur
+            $OAuth2 = new OAuth2Controller($SETTINGS);
+
+            // Traitement de la réponse de callback Azure
+            $usersList = $OAuth2->getAllUsers();            
+
+            // Get all groups in Teampass
+            $teampassRoles = array();
+            $titleToIdMap = [];
+            $rows = DB::query('SELECT id,title FROM ' . prefixTable('roles_title'));
+            foreach ($rows as $record) {
+                array_push(
+                    $teampassRoles,
+                    array(
+                        'id' => $record['id'],
+                        'title' => $record['title']
+                    )
+                );
+                $titleToIdMap[$record['title']] = $record['id'];
+            }
+
+            // Do init
+            $adUsersToSync = [];
+            $adRoles = [];
+            $usersAlreadyInTeampass = [];
+
+            function nameFromEmail($email) {
+                // Guard against null / non-string values (e.g. Entra hybrid objects
+                // returned without a userPrincipalName) — preg_match() would fatal on PHP 8.
+                if (!is_string($email) || $email === '') {
+                    return false;
+                }
+                // Extract the text before the domain
+                if (preg_match('/^(.+)@/', $email, $matches)) {
+                    return $matches[1];
+                } else {
+                    return false;
+                }
+            }
+
+            // Count directory objects skipped because they have no usable login (missing UPN)
+            $skippedUsersWithoutUpn = 0;
+            
+            foreach ($usersList as $oAuthUser) {
+                // Build the list of all groups in AD
+                if (isset($oAuthUser['groups']) === true) {
+                    foreach ($oAuthUser['groups'] as $group) {
+                        if (
+                            isset($group['displayName']) && !in_array($group['displayName'], $adRoles)
+                            && $SETTINGS['oauth_self_register_groups'] !== $group['displayName']
+                        ) {
+                            $adRoles[] = $group['displayName'];
+                        }
+                    }
+                }
+
+                // Is user in Teampass ?
+                $userLogin = nameFromEmail($oAuthUser['userPrincipalName']);
+                if (false !== $userLogin) {
+                    // Get his ID and auth type
+                    $userInfo = DB::queryFirstRow(
+                        'SELECT id, login, auth_type
+                        FROM ' . prefixTable('users') . '
+                        WHERE login = %s',
+                        $userLogin
+                    );
+                    
+                    // Get user's roles from users_roles table (all sources)
+                    $userGroupsInTeampass = [];
+                    if ($userInfo !== null) {
+                        $userRoles = DB::query(
+                            'SELECT role_id FROM ' . prefixTable('users_roles') . '
+                            WHERE user_id = %i',
+                            $userInfo['id']
+                        );
+                        $userGroupsInTeampass = array_column($userRoles, 'role_id');
+                    }
+                    
+                    // Loop on all user attributes
+                    $userADInfos = [
+                        'userInTeampass' => isset($userInfo) ? (int) $userInfo['id'] : 0,
+                        'userAuthType' => isset($userInfo) ? $userInfo['auth_type'] : 0,     
+                        'login' => $userLogin,
+                        'mail' => '',
+                    ];
+                    foreach ($oAuthUser as $key => $value) {
+                        if ($key !== 'groups') {
+                            $userADInfos[$key] = $value;
+                        } else {
+                            $userADInfos[$key] = array_column($value, 'displayName');
+                        }
+                    }
+
+                    // Mettre à jour $user['groups']
+                    $updatedGroups = array();
+                    foreach ($userADInfos['groups'] as $groupName) {
+                        if (isset($titleToIdMap[$groupName])) {
+                            $updatedGroups[] = array(
+                                'name' => $groupName,
+                                'id' => $titleToIdMap[$groupName],
+                                'insideGroupInTeampass' => in_array($titleToIdMap[$groupName], $userGroupsInTeampass) ? 1 : 0,
+                            );
+                        } else {
+                            $updatedGroups[] = array(
+                                'name' => $groupName,
+                                'id' => null,
+                                'insideGroupInTeampass' => 0,
+                            );
+                        }
+                    }
+
+                    // Mettre à jour $user['groups'] avec les nouveaux groupes
+                    $userADInfos['groups'] = $updatedGroups;
+                    array_push($adUsersToSync, $userADInfos);
+                } else {
+                    // No usable userPrincipalName (common with Entra hybrid objects) — skip
+                    $skippedUsersWithoutUpn++;
+                }
+            }
+
+            if ($skippedUsersWithoutUpn > 0) {
+                error_log('TEAMPASS OAuth2 - user sync skipped ' . $skippedUsersWithoutUpn . ' directory object(s) without a usable userPrincipalName');
+            }
+
+            echo (string) prepareExchangedData(
+                array(
+                    'error' => false,
+                    'ad_users' => $adUsersToSync,
+                    'ad_groups' => $adRoles,
+                    'teampass_groups' => $teampassRoles,
+                ), 
+                'encode'
+            );
+
+            break;
+
+
+        /*
+         * CHANGE USER DISABLE
+         */
+        case 'manage_user_disable_status':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Is this user allowed to do this?
+            if (
+                (int) $session->get('user-admin') !== 1
+                && (int) $session->get('user-can_manage_all_users') !== 1
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_id = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+            $post_user_disabled = filter_var($dataReceived['disabled_status'], FILTER_SANITIZE_NUMBER_INT);
+
+
+            // Empty user
+            if (empty($post_id) === true) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_not_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            // Check if user already exists
+            DB::query(
+                'SELECT id
+                FROM ' . prefixTable('users') . '
+                WHERE id = %i',
+                $post_id
+            );
+
+            if (DB::count() > 0) {
+                // Change authentication type in DB
+                DB::update(
+                    prefixTable('users'),
+                    array(
+                        'disabled' => empty($post_user_disabled) === true ? 0 : $post_user_disabled,
+                    ),
+                    'id = %i',
+                    $post_id
+                );
+
+                // update LOG
+                logEvents(
+                    $SETTINGS,
+                    'user_mngt',
+                    (int) $post_user_disabled === 1 ? 'at_user_locked' : 'at_user_unlocked',
+                    (string) $session->get('user-id'),
+                    $session->get('user-login'),
+                    $post_id
+                );
+
+                // Force-disconnect the disabled user if currently connected via WebSocket
+                if ((int) $post_user_disabled === 1) {
+                    emitWebSocketEvent('session_expired', 'user', intval($post_id), [
+                        'reason' => 'account_disabled',
+                    ]);
+                }
+
+                // Leaver risk (F3): optionally auto-flag for rotation every shared
+                // credential the disabled account could read.
+                if ((int) $post_user_disabled === 1
+                    && (int) ($SETTINGS['leaver_risk_enabled'] ?? 0) === 1
+                    && (int) ($SETTINGS['leaver_risk_auto_flag'] ?? 0) === 1
+                ) {
+                    require_once __DIR__ . '/leaver.functions.php';
+                    $leaverItems = leaverRiskSharedItems((int) $post_id);
+                    $flaggedCount = leaverRiskFlagItems(
+                        array_column($leaverItems, 'item_id'),
+                        (int) $post_id,
+                        (int) $session->get('user-id')
+                    );
+                    if ($flaggedCount > 0) {
+                        logEvents(
+                            $SETTINGS,
+                            'user_mngt',
+                            'at_leaver_items_flagged',
+                            (string) $session->get('user-id'),
+                            $session->get('user-login'),
+                            (string) $post_id
+                        );
+                    }
+                }
+            } else {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_not_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'message' => '',
+                    'error' => false,
+                ),
+                'encode'
+            );
+
+            break;
+
+        /*
+         * LEAVER RISK REPORT (F3)
+         * Shared credentials a (disabled/leaving) user could read.
+         */
+        case 'get_leaver_risk_report':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Is this user allowed to do this?
+            if (
+                (int) $session->get('user-admin') !== 1
+                && (int) $session->get('user-can_manage_all_users') !== 1
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Feature gate
+            if ((int) ($SETTINGS['leaver_risk_enabled'] ?? 0) !== 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_id = (int) filter_input(INPUT_POST, 'user_id', FILTER_SANITIZE_NUMBER_INT);
+            if ($post_id <= 0) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_not_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Optional folder filter (+ subtree expansion)
+            $post_folder_ids = filter_input(INPUT_POST, 'folder_ids', FILTER_SANITIZE_NUMBER_INT, FILTER_REQUIRE_ARRAY);
+            $post_include_children = (int) filter_input(INPUT_POST, 'include_children', FILTER_SANITIZE_NUMBER_INT);
+
+            require_once __DIR__ . '/leaver.functions.php';
+            $folderScope = leaverRiskResolveFolderScope(
+                is_array($post_folder_ids) === true ? $post_folder_ids : [],
+                $post_include_children === 1
+            );
+            $leaverItems = leaverRiskSharedItems($post_id, $folderScope);
+
+            // Return metadata only (labels + folder + counters — never any password)
+            $reportRows = [];
+            foreach ($leaverItems as $leaverItem) {
+                $reportRows[] = [
+                    'item_id' => (int) $leaverItem['item_id'],
+                    'label' => $leaverItem['label'],
+                    'folder_title' => $leaverItem['folder_title'],
+                    'other_users' => (int) $leaverItem['other_users'],
+                    'last_pw_change' => (int) $leaverItem['last_pw_change'],
+                    'display_status' => $leaverItem['display_status'],
+                ];
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'items' => $reportRows,
+                ),
+                'encode'
+            );
+
+            break;
+
+        /*
+         * LEAVER RISK — FLAG ITEMS FOR ROTATION (F3)
+         */
+        case 'flag_leaver_items_for_rotation':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Is this user allowed to do this?
+            if (
+                (int) $session->get('user-admin') !== 1
+                && (int) $session->get('user-can_manage_all_users') !== 1
+            ) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Feature gate
+            if ((int) ($SETTINGS['leaver_risk_enabled'] ?? 0) !== 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_leaver_id = (int) filter_var($dataReceived['user_id'] ?? 0, FILTER_SANITIZE_NUMBER_INT);
+            $post_item_ids = isset($dataReceived['item_ids']) === true && is_array($dataReceived['item_ids']) === true
+                ? $dataReceived['item_ids'] : [];
+            $post_flag_all = (int) filter_var($dataReceived['flag_all'] ?? 0, FILTER_SANITIZE_NUMBER_INT);
+
+            if ($post_leaver_id <= 0) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('user_not_exists'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            require_once __DIR__ . '/leaver.functions.php';
+
+            // Same folder filter as the report — "flag all" only covers the
+            // subset currently displayed to the admin.
+            $post_folder_ids = isset($dataReceived['folder_ids']) === true && is_array($dataReceived['folder_ids']) === true
+                ? $dataReceived['folder_ids'] : [];
+            $post_include_children = (int) filter_var($dataReceived['include_children'] ?? 0, FILTER_SANITIZE_NUMBER_INT);
+            $folderScope = leaverRiskResolveFolderScope($post_folder_ids, $post_include_children === 1);
+
+            // Recompute the eligible set server-side — the client cannot flag
+            // items the leaver had no access to.
+            $eligibleIds = array_column(leaverRiskSharedItems($post_leaver_id, $folderScope), 'item_id');
+            $itemIdsToFlag = $post_flag_all === 1
+                ? array_map('intval', $eligibleIds)
+                : leaverRiskValidateItemIds($post_item_ids, $eligibleIds);
+
+            $flaggedCount = leaverRiskFlagItems($itemIdsToFlag, $post_leaver_id, (int) $session->get('user-id'));
+
+            if ($flaggedCount > 0) {
+                logEvents(
+                    $SETTINGS,
+                    'user_mngt',
+                    'at_leaver_items_flagged',
+                    (string) $session->get('user-id'),
+                    $session->get('user-login'),
+                    (string) $post_leaver_id
+                );
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'flagged_count' => $flaggedCount,
+                ),
+                'encode'
+            );
+
+            break;
+
+        case "create_new_user_tasks":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $post_user_id = (int) filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+            $post_user_code = filter_var($dataReceived['user_code'], FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+
+            // Search TP_USER in db        
+            $userTP = DB::queryFirstRow(
+                'SELECT pw
+                FROM ' . prefixTable('users') . '
+                WHERE id = %i',
+                TP_USER_ID
+            );
+            if (DB::count() === 0) {
+                return prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => 'User not exists',
+                    ),
+                    'encode'
+                );
+            }
+
+            // Create process
+            DB::insert(
+                prefixTable('background_tasks'),
+                array(
+                    'created_at' => time(),
+                    'process_type' => 'create_user_keys',
+                    'arguments' => json_encode([
+                        'new_user_id' => (int) $post_user_id,
+                        'new_user_pwd' => '',
+                        'new_user_code' => cryption($post_user_code, '','encrypt', $SETTINGS)['string'],
+                        'owner_id' => (int) TP_USER_ID,
+                        'creator_pwd' => $userTP['pw'],
+                        'email_body' => 'email_body_user_config_4',
+                        'send_email' => 1,
+                        'otp_provided_new_value' => 0,
+                        'user_self_change' => 0,
+                    ]),
+                    'updated_at' => '',
+                    'finished_at' => '',
+                    'output' => '',
+                )
+            );
+            $processId = DB::insertId();
+
+            // Create tasks
+            createUserTasks(
+                $processId,
+                isset($SETTINGS['maximum_number_of_items_to_treat']) === true ? $SETTINGS['maximum_number_of_items_to_treat'] : NUMBER_ITEMS_IN_BATCH
+            );
+
+            // Generate user keys with the code and transparent recovery support
+            $userKeys = generateUserKeys($post_user_code, $SETTINGS);
+
+            // Prepare update data
+            $updateData = array(
+                'is_ready_for_usage' => 1,
+                'otp_provided' => 0,
+                'ongoing_process_id' => $processId,
+                'special' => 'generate-keys',
+                'public_key' => $userKeys['public_key'],
+                'private_key' => $userKeys['private_key'],
+                // Notify user that he must re download his keys:
+                'keys_recovery_time' => NULL,
+            );
+
+            // Add transparent recovery fields if available
+            if (isset($userKeys['user_seed'])) {
+                $updateData['user_derivation_seed'] = $userKeys['user_seed'];
+                $updateData['private_key_backup'] = $userKeys['private_key_backup'];
+                $updateData['key_integrity_hash'] = $userKeys['key_integrity_hash'];
+                $updateData['last_pw_change'] = time();
+            }
+
+            // Update user
+            DB::update(
+                prefixTable('users'),
+                $updateData,
+                'id = %i',
+                $post_user_id
+            );
+
+            // Store private key in dedicated table
+            insertPrivateKeyWithCurrentFlag($post_user_id, $userKeys['private_key']);
+
+            // Trigger background handler
+            triggerBackgroundHandler();
+
+            echo prepareExchangedData(
+                array(
+                    'message' => '',
+                    'error' => false,
+                ),
+                'encode'
+            );
+
+            break;
+
+        /*
+        * WHAT IS THE PROGRESS OF GENERATING NEW KEYS AND OTP FOR A USER
+        */
+        case 'get_generate_keys_progress':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (isset($dataReceived['user_id']) === false) {
+                // Exit nothing to be done
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => '',
+                        'user_id' => '',
+                        'status' => '',
+                        'debug' => '',
+                    ),
+                    'encode'
+                );
+            }
+
+            // Prepare variables
+            $user_id = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+
+            // get user info
+            $processesProgress = DB::query(
+                'SELECT u.ongoing_process_id, pt.task, pt.updated_at, pt.finished_at, pt.is_in_progress
+                FROM ' . prefixTable('users') . ' AS u
+                INNER JOIN ' . prefixTable('background_subtasks') . ' AS pt ON (pt.task_id = u.ongoing_process_id)
+                WHERE u.id = %i',
+                $user_id
+            );
+
+            $finished_steps = 0;
+            $nb_steps = count($processesProgress);
+            foreach($processesProgress as $process) {
+                if ((int) $process['is_in_progress'] === -1) {
+                    $finished_steps ++;
+                }
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'message' => '',
+                    'user_id' => $user_id,
+                    'status' => $finished_steps === $nb_steps ? 'finished' : number_format($finished_steps/$nb_steps*100, 0).'%',
+                    'debug' => $finished_steps.",".$nb_steps,
+                ),
+                'encode'
+            );
+
+            break;
+
+
+        /**
+         * CHECK IF USER IS FINISHED WITH GENERATING NEW KEYS AND OTP FOR A USER
+         */
+        case "get_user_infos":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $user_id = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+
+            $fullUserInfos = getFullUserInfos((int) $user_id);
+
+            // Filter only on useful fields
+            $userInfos['id'] = $fullUserInfos['id'];
+            $userInfos['ongoing_process_id'] = $fullUserInfos['ongoing_process_id'];
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'message' => '',
+                    'user_id' => $user_id,
+                    'user_infos' => $userInfos,
+                    'debug' => '',
+                ),
+                'encode'
+            );
+
+            break;
+        
+        case "reset_antibruteforce":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $login = getFullUserInfos((int) $dataReceived['user_id'])['login'];
+
+            // Delete all logs for this user
+            DB::delete(
+                prefixTable('auth_failures'),
+                'source = %s AND value = %s',
+                'login',
+                $login
+            );
+            
+            break;
+        
+        case "list_deleted_users":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $result = listDeletedUsers();
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'result' => $result,
+                    'debug' => '',
+                ),
+                'encode'
+            );
+            
+            break;
+
+        case "count_never_connected_active_users":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'count' => countNeverConnectedActiveUsers(),
+                ),
+                'encode'
+            );
+
+            break;
+
+        case "list_inactive_users":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $filter = isset($dataReceived['filter']) ? (string) $dataReceived['filter'] : 'never';
+            $result = listInactiveUsers($filter);
+
+            echo prepareExchangedData(
+                array(
+                    'error' => false,
+                    'result' => $result,
+                ),
+                'encode'
+            );
+
+            break;
+
+        case "disable_users_batch":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $userIds = isset($dataReceived['user_ids']) && is_array($dataReceived['user_ids'])
+                ? array_map('intval', $dataReceived['user_ids'])
+                : array();
+
+            if (empty($userIds)) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_empty_data'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            echo prepareExchangedData(
+                disableUsersBatch($userIds, 1, $SETTINGS),
+                'encode'
+            );
+
+            break;
+
+        case "delete_users_batch":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            } elseif ($session->get('user-read_only') === 1) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed_to'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            $userIds = isset($dataReceived['user_ids']) && is_array($dataReceived['user_ids'])
+                ? array_map('intval', $dataReceived['user_ids'])
+                : array();
+
+            if (empty($userIds)) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('error_empty_data'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            echo prepareExchangedData(
+                deleteUsersBatch($userIds, $SETTINGS),
+                'encode'
+            );
+
+            break;
+
+        case "purge_user":
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed'),
+                    ],
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $userId = (int) filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+        
+            if (empty($userId)) {
+                echo prepareExchangedData([
+                    'error' => true,
+                    'message' => $lang->get('error_empty_data'),
+                ], 'encode');
+                break;
+            }
+            
+            $result = purgeDeletedUserById($userId, false);
+
+            // Rebuild tree outside of the purge transaction if needed
+            if (isset($result['error']) === true && (bool) $result['error'] === false && isset($result['tree_changed']) === true && (bool) $result['tree_changed'] === true) {
+                $treeLocal = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+                $treeLocal->rebuild();
+            }
+
+            $deletedAccountsCount = (int) DB::queryFirstField(
+                "SELECT COUNT(id) FROM " . prefixTable('users') . " WHERE deleted_at IS NOT NULL"
+            );
+
+            echo prepareExchangedData(
+                [
+                    'error' => (bool) $result['error'],
+                    'message' => $result['message'],
+                    'result' => $result,
+                    'deleted_accounts_count' => $deletedAccountsCount,
+                ],
+                'encode'
+            );
+break;
+
+        case 'get_purgeable_users':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed'),
+                    ],
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $daysRetention = filter_var($dataReceived['days_retention'], FILTER_SANITIZE_NUMBER_INT);
+            $daysRetention = empty($daysRetention) ? 90 : (int)$daysRetention;
+            $cutoffTimestamp = time() - ($daysRetention * 86400);
+            
+            try {
+                // Get list of users to delete
+                $users = DB::query(
+                    "SELECT id FROM " . prefixTable("users") . " 
+                    WHERE deleted_at IS NOT NULL 
+                    AND deleted_at > 0
+                    AND deleted_at < %i
+                    ORDER BY deleted_at ASC",
+                    $cutoffTimestamp
+                );
+                
+                $userIds = array_column($users, 'id');
+                
+                echo prepareExchangedData(
+                    [
+                        'error' => false,
+                        'user_ids' => $userIds,
+                        'count' => count($userIds),
+                        'retention_days' => $daysRetention
+                    ],
+                    'encode'
+                );
+                
+            } catch (Exception $e) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error') . ': ' . $e->getMessage(),
+                    ],
+                    'encode'
+                );
+            }
+            
+            break;
+
+        case 'purge_users_batch':            
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed'),
+                    ],
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $daysRetention = filter_var($dataReceived['days_retention'], FILTER_SANITIZE_NUMBER_INT);
+            $userIds = filter_var_array(
+                $dataReceived['user_ids'],
+                FILTER_SANITIZE_NUMBER_INT
+            );
+            
+            // Ensure user id has been provided
+            if (empty($userIds)) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error_empty_data'),
+                    ],
+                    'encode'
+                );
+                break;
+            }
+            
+            $purgedCount = 0;
+            $errors = [];
+            $treeNeedsRebuild = false;
+
+            foreach ($userIds as $userId) {
+                $userId = (int) $userId;
+
+                try {
+                    $result = purgeDeletedUserById($userId, false);
+
+                    if (!empty($result['tree_changed'])) {
+                        $treeNeedsRebuild = true;
+                    }
+
+                    if (!empty($result['error'])) {
+                        $errors[] = str_replace(
+                            ['%id%', '%message%'],
+                            [(string) $userId, (string) $result['message']],
+                            $lang->get('user_purge_failed_for_id')
+                        );
+                        continue;
+                    }
+
+                    $purgedCount++;
+                } catch (Exception $e) {
+                    DB::rollback();
+                    $errors[] = str_replace(
+                        ['%id%', '%message%'],
+                        [(string) $userId, (string) $e->getMessage()],
+                        $lang->get('user_purge_failed_for_id')
+                    );
+                }
+            }
+
+            // Rebuild tree once for this batch if needed
+            if ($treeNeedsRebuild === true) {
+                try {
+                    $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+                    $tree->rebuild();
+                } catch (Exception $e) {
+                    $errors[] = str_replace(
+                        ['%id%', '%message%'],
+                        ['-', (string) $e->getMessage()],
+                        $lang->get('user_purge_failed_for_id')
+                    );
+                }
+            }
+
+            $deletedAccountsCount = (int) DB::queryFirstField(
+                "SELECT COUNT(id) FROM " . prefixTable('users') . " WHERE deleted_at IS NOT NULL"
+            );
+
+            echo prepareExchangedData(
+                [
+                    'error' => false,
+                    'purged_count' => $purgedCount,
+                    'total_in_batch' => count($userIds),
+                    'errors' => $errors,
+                    'message' => str_replace('%count%', (string) $purgedCount, $lang->get('users_purged_in_batch')),
+                    'deletedAccountsCount' => $deletedAccountsCount,
+                ],
+                'encode'
+            );
+break;
+
+        case 'restore_user':
+            // Check KEY
+            if ($post_key !== $session->get('key')) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => $lang->get('key_is_not_correct'),
+                    ),
+                    'encode'
+                );
+                break;
+            }
+
+            if (canAccessInactiveAndDeletedUsersPanels() === false) {
+                echo prepareExchangedData(
+                    [
+                        'error' => true,
+                        'message' => $lang->get('error_not_allowed'),
+                    ],
+                    'encode'
+                );
+                break;
+            }
+
+            // Prepare variables
+            $userId = filter_var($dataReceived['user_id'], FILTER_SANITIZE_NUMBER_INT);
+            
+            // Get info about user
+            $data_user = DB::queryFirstRow(
+                'SELECT login FROM ' . prefixTable('users') . ' WHERE id = %i',
+                $userId
+            );
+            
+            if ($data_user === null) {
+                echo prepareExchangedData(
+                    array('error' => true, 'message' => $lang->get('user_not_found_or_not_deleted')),
+                    'encode'
+                );
+                break;
+            }
+            
+            // Remove user suffix "_deleted_timestamp"
+            $deletedSuffix = '_deleted_' . substr($data_user['login'], strrpos($data_user['login'], '_deleted_') + 9);
+            $originalLogin = str_replace($deletedSuffix, '', $data_user['login']);
+                        
+            // Check if an active user with the original login already exists
+            $existingUser = DB::queryFirstRow(
+                'SELECT id FROM ' . prefixTable('users') . '
+                WHERE login = %s AND deleted_at IS NULL AND id != %i',
+                $originalLogin,
+                $userId
+            );
+
+            if (DB::count() > 0) {
+                echo prepareExchangedData(
+                    array(
+                        'error' => true,
+                        'message' => str_replace(['%login%', '%id%'], [$originalLogin, (string) $existingUser['id']], $lang->get('user_restore_active_user_exists'))
+                    ),
+                    'encode'
+                );
+                break;
+            }
+            
+            // Restore user and give the account a fresh inactivity baseline.
+            $now = time();
+            DB::update(
+                prefixTable('users'),
+                array(
+                    'login' => $originalLogin,
+                    'deleted_at' => null,
+                    'disabled' => 0,
+                    'last_connexion' => $now,
+                    'timestamp' => $now,
+                    'updated_at' => $now,
+                    'inactivity_warned_at' => null,
+                    'inactivity_action_at' => null,
+                    'inactivity_action' => null,
+                    'inactivity_no_email' => 0,
+                ),
+                'id = %i',
+                $userId
+            );
+
+            logEvents(
+                $SETTINGS,
+                'user_mngt',
+                'at_restored',
+                (string) $session->get('user-id'),
+                $session->get('user-login'),
+                (string) $userId
+            );
+            
+            echo prepareExchangedData(
+                array('error' => false, 'message' => $lang->get('user_restored_successfully')),
+                'encode'
+            );
+            break;
+    }
+}
+
+// SECURITY (GHSA-58ph-5gg6-h2v8): the legacy 'newValue' and 'newadmin' branches used to sit here.
+// Selected by the mere absence of a "type" parameter, they were evaluated outside the block above
+// and re-implemented their own, laxer authorization check. They let a manager rewrite a target
+// account's 'pw' (stored verbatim: unhashed, no complexity check, no key regeneration), 'login'
+// and 'email', and set the 'admin' flag, enabling silent takeover of a managed account.
+// They had no caller: user administration goes through the "save_user_change" action and profile
+// preferences through "user_profile_update", both subject to the target-scope guard above.
+// Do not reintroduce a request-driven column write outside that guard.
+
+function canAccessInactiveAndDeletedUsersPanels(): bool
+{
+    $session = SessionManager::getSession();
+
+    return (int) $session->get('user-admin') === 1;
+}
+
+// callerMayManageUser() lives in main.functions.php: the rule is shared with the other entry
+// points whose target is not carried by 'user_id' (see users.logs.datatable.php).
+
+/**
+ * List deleted users
+ * 
+ * @return array
+ */
+function listDeletedUsers(): array
+{
+    $users = DB::query(
+        "SELECT id, login, email, deleted_at, 
+                DATEDIFF(NOW(), FROM_UNIXTIME(deleted_at)) as days_since_deletion
+         FROM " . prefixTable("users") . " 
+         WHERE deleted_at IS NOT NULL 
+         AND deleted_at > 0
+         ORDER BY deleted_at DESC"
+    );
+    
+    return [
+        'error' => false,
+        'users' => $users,
+        'count' => count($users)
+    ];
+}
+
+function countNeverConnectedActiveUsers(): int
+{
+    return (int) DB::queryFirstField(
+        "SELECT COUNT(u.id)
+         FROM " . prefixTable('users') . " AS u
+         LEFT JOIN (
+             SELECT li.id_user, MAX(li.date) AS last_api_activity_ts
+             FROM " . prefixTable('log_items') . " AS li
+             INNER JOIN " . prefixTable('users') . " AS lu
+                 ON lu.id = li.id_user
+                 AND lu.deleted_at IS NULL
+                 AND lu.disabled = 0
+                 AND LOWER(lu.login) NOT IN ('api','otv','tp')
+             WHERE li.action IN %ls
+             AND li.raison LIKE %ss
+             GROUP BY li.id_user
+         ) AS api_activity ON api_activity.id_user = u.id
+         WHERE u.deleted_at IS NULL
+         AND u.disabled = 0
+         AND LOWER(u.login) NOT IN ('api','otv','tp')
+         AND (u.last_connexion IS NULL OR u.last_connexion = '' OR u.last_connexion = '0')
+         AND api_activity.last_api_activity_ts IS NULL",
+        teampassApiFunctionalActivityActions(),
+        'tp_src=api'
+    );
+}
+
+/**
+ * List inactive users based on their last functional activity.
+ *
+ * Accepted filters:
+ *  - 'never'
+ *  - '90', '180', '365'
+ */
+function listInactiveUsers(string $filter): array
+{
+    $filter = trim($filter);
+
+    // Exclude admins and TeamPass system/special accounts
+    $baseWhere = "u.deleted_at IS NULL AND u.disabled = 0 AND u.admin = 0 AND u.special = 'none' AND LOWER(u.login) NOT IN ('api','otv','tp')";
+
+    // Extract a unix timestamp from last_connexion when possible.
+    // Supports:
+    // - epoch seconds (10 digits)
+    // - epoch milliseconds (13 digits)
+    // - datetime strings parseable by MySQL's UNIX_TIMESTAMP()
+    $tsExpr = "CASE
+        WHEN u.last_connexion REGEXP '^[0-9]{13}$' THEN FLOOR(CAST(u.last_connexion AS UNSIGNED)/1000)
+        WHEN u.last_connexion REGEXP '^[0-9]{10}$' THEN CAST(u.last_connexion AS UNSIGNED)
+        WHEN u.last_connexion REGEXP '^[0-9]{1,9}$' THEN CAST(u.last_connexion AS UNSIGNED)
+        ELSE UNIX_TIMESTAMP(u.last_connexion)
+    END";
+
+    // Same logic for created_at (used for never connected users)
+    $createdTsExpr = "CASE
+        WHEN u.created_at REGEXP '^[0-9]{13}$' THEN FLOOR(CAST(u.created_at AS UNSIGNED)/1000)
+        WHEN u.created_at REGEXP '^[0-9]{10}$' THEN CAST(u.created_at AS UNSIGNED)
+        WHEN u.created_at REGEXP '^[0-9]{1,9}$' THEN CAST(u.created_at AS UNSIGNED)
+        ELSE UNIX_TIMESTAMP(u.created_at)
+    END";
+    $apiActivityJoin = "LEFT JOIN (
+            SELECT li.id_user, MAX(li.date) AS last_api_activity_ts
+            FROM " . prefixTable('log_items') . " AS li
+            INNER JOIN " . prefixTable('users') . " AS lu
+                ON lu.id = li.id_user
+                AND lu.deleted_at IS NULL
+                AND lu.disabled = 0
+                AND lu.admin = 0
+                AND lu.special = 'none'
+                AND LOWER(lu.login) NOT IN ('api','otv','tp')
+            WHERE li.action IN %ls
+            AND li.raison LIKE %ss
+            GROUP BY li.id_user
+        ) AS api_activity ON api_activity.id_user = u.id";
+    $activityTsExpr = "GREATEST(IFNULL(($tsExpr), 0), IFNULL(api_activity.last_api_activity_ts, 0))";
+
+    if ($filter === 'never') {
+        $users = DB::query(
+            "SELECT u.id, u.login, u.email,
+                    u.inactivity_warned_at, u.inactivity_action_at, u.inactivity_action, u.inactivity_no_email,
+                    ($activityTsExpr) as last_connexion_ts,
+                    1 as never_connected,
+                    FLOOR((%i - ($createdTsExpr))/86400) as days_inactive
+             FROM " . prefixTable('users') . " AS u
+             $apiActivityJoin
+             WHERE $baseWhere
+             AND ($activityTsExpr) <= 0
+             ORDER BY u.login ASC",
+            time(),
+            teampassApiFunctionalActivityActions(),
+            'tp_src=api'
+        );
+    } else {
+        $days = (int) $filter;
+        if (!in_array($days, array(90, 180, 365), true)) {
+            $days = 90;
+        }
+        $cutoff = time() - ($days * 86400);
+
+        $users = DB::query(
+            "SELECT u.id, u.login, u.email,
+                    u.inactivity_warned_at, u.inactivity_action_at, u.inactivity_action, u.inactivity_no_email,
+                    ($activityTsExpr) as last_connexion_ts,
+                    0 as never_connected,
+                    FLOOR((%i - ($activityTsExpr))/86400) as days_inactive
+             FROM " . prefixTable('users') . " AS u
+             $apiActivityJoin
+             WHERE $baseWhere
+             AND ($activityTsExpr) > 0
+             AND ($activityTsExpr) < %i
+             ORDER BY ($activityTsExpr) ASC",
+            time(),
+            teampassApiFunctionalActivityActions(),
+            'tp_src=api',
+            $cutoff
+        );
+    }
+
+    return array(
+        'users' => $users,
+        'count' => count($users),
+    );
+}
+
+
+/**
+ * Batch disable users (uses same semantics as manage_user_disable_status)
+ */
+function disableUsersBatch(array $userIds, int $disabledStatus, array $SETTINGS): array
+{
+    $session = SessionManager::getSession();
+
+    $done = 0;
+    $errors = array();
+
+    $systemLogins = array('api', 'otv', 'tp');
+
+    foreach ($userIds as $userId) {
+        $userId = (int) $userId;
+        if ($userId <= 0) {
+            continue;
+        }
+
+        $target = DB::queryFirstRow(
+            'SELECT id, login, deleted_at FROM ' . prefixTable('users') . ' WHERE id = %i',
+            $userId
+        );
+
+        if (empty($target) || $target['deleted_at'] !== null) {
+            $errors[] = 'User ID ' . $userId . ' not found or already deleted';
+            continue;
+        }
+
+        if (in_array(strtolower((string) $target['login']), $systemLogins, true)) {
+            $errors[] = 'User ID ' . $userId . ' is a system account and cannot be disabled';
+            continue;
+        }
+
+        DB::update(
+            prefixTable('users'),
+            array(
+                'disabled' => empty($disabledStatus) === true ? 0 : $disabledStatus,
+            ),
+            'id = %i',
+            $userId
+        );
+
+        logEvents(
+            $SETTINGS,
+            'user_mngt',
+            $disabledStatus === 1 ? 'at_user_locked' : 'at_user_unlocked',
+            (string) $session->get('user-id'),
+            $session->get('user-login'),
+            (string) $userId
+        );
+
+        $done++;
+    }
+
+    return array(
+        'error' => false,
+        'done' => $done,
+        'errors' => $errors,
+    );
+}
+
+/**
+ * Batch soft-delete users (same behavior as delete_user case)
+ */
+function deleteUsersBatch(array $userIds, array $SETTINGS): array
+{
+    $session = SessionManager::getSession();
+
+    $done = 0;
+    $errors = array();
+
+    $systemLogins = array('api', 'otv', 'tp');
+
+    foreach ($userIds as $userId) {
+        $userId = (int) $userId;
+        if ($userId <= 0) {
+            continue;
+        }
+
+        $data_user = DB::queryFirstRow(
+            'SELECT login, admin, isAdministratedByRole, deleted_at FROM ' . prefixTable('users') . '
+            WHERE id = %i',
+            $userId
+        );
+
+        if (empty($data_user) || $data_user['deleted_at'] !== null) {
+            $errors[] = 'User ID ' . $userId . ' not found or already deleted';
+            continue;
+        }
+
+        if (isset($data_user['login']) && in_array(strtolower((string) $data_user['login']), $systemLogins, true)) {
+            $errors[] = 'User ID ' . $userId . ' is a system account and cannot be deleted';
+            continue;
+        }
+
+        // Is this user allowed to do this? (same as delete_user)
+        if (
+            (int) $session->get('user-admin') === 1
+            || (in_array($data_user['isAdministratedByRole'], $session->get('user-roles_array')))
+            || ((int) $session->get('user-can_manage_all_users') === 1 && (int) $data_user['admin'] !== 1)
+        ) {
+            DB::startTransaction();
+            try {
+                $timestamp = time();
+                $deletedSuffix = '_deleted_' . $timestamp;
+
+                DB::update(
+                    prefixTable('users'),
+                    array(
+                        'login' => $data_user['login'].$deletedSuffix,
+                        'deleted_at' => $timestamp,
+                        'disabled' => 1,
+                        'special' => 'none',
+                    ),
+                    'id = %i',
+                    $userId
+                );
+
+                logEvents($SETTINGS, 'user_mngt', 'at_user_deleted', (string) $session->get('user-id'), $session->get('user-login'), (string) $userId);
+
+                DB::commit();
+                $done++;
+            } catch (Exception $e) {
+                DB::rollback();
+                $errors[] = 'User ID ' . $userId . ': ' . $e->getMessage();
+            }
+        } else {
+            $errors[] = 'User ID ' . $userId . ': not allowed';
+        }
+    }
+
+    return array(
+        'error' => false,
+        'done' => $done,
+        'errors' => $errors,
+    );
+}
+
+
+
+/**
+ * Escape a value for usage in an LDAP filter (RFC 4515).
+ */
+function tpLdapEscapeFilterValue(string $value): string
+{
+    // Use native ldap_escape when available
+    if (function_exists('ldap_escape')) {
+        // LDAP_ESCAPE_FILTER constant exists in ext/ldap
+        if (defined('LDAP_ESCAPE_FILTER')) {
+            return ldap_escape($value, '', LDAP_ESCAPE_FILTER);
+        }
+        return ldap_escape($value);
+    }
+
+    $map = array(
+        '\\' => '\5c',
+        '*'  => '\2a',
+        '('  => '\28',
+        ')'  => '\29',
+        "\x00" => '\00',
+    );
+
+    return strtr($value, $map);
+}
+
+/**
+ * Build a valid LDAP filter from the user-object-filter setting.
+ *
+ * The setting accepts either a single filter, e.g. "(objectClass=user)", or
+ * several filters separated by a top-level comma, e.g.
+ * "(objectCategory=Person),(sAMAccountName=*)". Multiple filters are combined
+ * with a logical AND. Commas located inside a value (e.g. a DN like
+ * "memberOf=CN=x,OU=y") are preserved.
+ *
+ * @param string $rawFilter Raw value stored in settings.
+ * @return string A single valid LDAP filter, or '' when none provided.
+ */
+function tpLdapBuildObjectFilter(string $rawFilter): string
+{
+    $rawFilter = trim($rawFilter);
+    if ($rawFilter === '') {
+        return '';
+    }
+
+    // Split on commas located at the top level (parenthesis depth 0) only.
+    $parts = [];
+    $current = '';
+    $depth = 0;
+    $length = strlen($rawFilter);
+    for ($i = 0; $i < $length; $i++) {
+        $char = $rawFilter[$i];
+        if ($char === '(') {
+            $depth++;
+        } elseif ($char === ')') {
+            $depth--;
+        }
+        if ($char === ',' && $depth === 0) {
+            $parts[] = $current;
+            $current = '';
+            continue;
+        }
+        $current .= $char;
+    }
+    $parts[] = $current;
+
+    // Drop empty segments (e.g. trailing comma).
+    $parts = array_values(array_filter(
+        array_map('trim', $parts),
+        static fn($p) => $p !== ''
+    ));
+
+    if (count($parts) === 0) {
+        return '';
+    }
+    if (count($parts) === 1) {
+        return $parts[0];
+    }
+
+    return '(&' . implode('', $parts) . ')';
+}
+
+/**
+ * Retrieve LDAP/AD status (disabled/expired) for a list of TeamPass user IDs.
+ * This is designed for the main Users page to avoid fetching the full LDAP directory.
+ */
+function getLdapStatusForUserIds(array $userIds, array $SETTINGS): array
+{
+    $session = SessionManager::getSession();
+    $lang = new Language($session->get('user-language') ?? 'english');
+    $statuses = array();
+
+    // Initialize with defaults (unknown)
+    foreach ($userIds as $uid) {
+        $uid = (int) $uid;
+        if ($uid > 0) {
+            $statuses[$uid] = array(
+                'ldapAccountMissing' => null,
+                'ldapAccountDisabled' => null,
+                'ldapAccountExpired' => null,
+                'ldapAccountExpiresAt' => null,
+            );
+        }
+    }
+
+    // Fetch Teampass users logins (LDAP-authenticated only)
+    $rows = DB::query(
+        'SELECT id, login, auth_type FROM ' . prefixTable('users') . ' WHERE id IN %li',
+        $userIds
+    );
+
+    $idToLogin = array();
+    $logins = array();
+    foreach ($rows as $r) {
+        if (isset($r['auth_type']) === true && $r['auth_type'] === 'ldap') {
+            $id = (int) $r['id'];
+            $login = (string) $r['login'];
+            if (!empty($login)) {
+                $idToLogin[$id] = $login;
+                $logins[] = $login;
+            }
+        }
+    }
+
+    if (empty($logins)) {
+        return array(
+            'error' => false,
+            'statuses' => $statuses,
+        );
+    }
+
+    // Build ldap configuration array
+    $config = [
+        'hosts'            => explode(',', (string) $SETTINGS['ldap_hosts']),
+        'base_dn'          => $SETTINGS['ldap_bdn'],
+        'username'         => $SETTINGS['ldap_username'],
+        'password'         => $SETTINGS['ldap_password'],
+        'port'             => $SETTINGS['ldap_port'],
+        'use_ssl'          => (int) $SETTINGS['ldap_ssl'] === 1,
+        'use_tls'          => (int) $SETTINGS['ldap_tls'] === 1,
+        'version'          => 3,
+        'timeout'          => 5,
+        'follow_referrals' => false,
+        'options' => [
+            LDAP_OPT_X_TLS_REQUIRE_CERT => isset($SETTINGS['ldap_tls_certificate_check']) === false ? 'LDAP_OPT_X_TLS_NEVER' : $SETTINGS['ldap_tls_certificate_check'],
+        ]
+    ];
+
+    $connection = new Connection($config);
+
+    try {
+        $connection->connect();
+    } catch (\LdapRecord\Auth\BindException $e) {
+        return array(
+            'error' => true,
+            'message' => $lang->get('ldap_connection_error'),
+            'statuses' => $statuses,
+        );
+    }
+
+    $attr = (string) $SETTINGS['ldap_user_attribute'];
+
+    // Build OR filter for requested logins
+    $orParts = '';
+    foreach ($logins as $login) {
+        $orParts .= '(' . $attr . '=' . tpLdapEscapeFilterValue($login) . ')';
+    }
+    $orFilter = '(|' . $orParts . ')';
+
+    // Combine with object filter
+    $objectFilter = tpLdapBuildObjectFilter((string) $SETTINGS['ldap_user_object_filter']);
+    $finalFilter = $objectFilter === ''
+        ? $orFilter
+        : '(&' . $objectFilter . $orFilter . ')';
+
+    // Attributes needed for status detection
+    $adQueryAttributes = array_values(array_unique(array(
+        $attr,
+        'useraccountcontrol', 'userAccountControl',
+        'accountexpires', 'accountExpires',
+        'shadowexpire',
+    )));
+
+    try {
+        $results = $connection->query()
+            ->select($adQueryAttributes)
+            ->rawfilter($finalFilter)
+            ->in((empty($SETTINGS['ldap_dn_additional_user_dn']) === false ? $SETTINGS['ldap_dn_additional_user_dn'].',' : '').$SETTINGS['ldap_bdn'])
+            ->whereHas($attr)
+            ->get();
+    } catch (\Exception $e) {
+        return array(
+            'error' => true,
+            'message' => $lang->get('ldap_query_error'),
+            'statuses' => $statuses,
+        );
+    }
+
+    // Build login -> status map
+    $loginStatus = array();
+    foreach ($results as $adUser) {
+        if (isset($adUser[$attr][0]) === false) {
+            continue;
+        }
+        $userLogin = (string) $adUser[$attr][0];
+
+        $tmp = array(
+            'ldapAccountMissing' => 0,
+            'ldapAccountDisabled' => null,
+            'ldapAccountExpired' => null,
+            'ldapAccountExpiresAt' => null,
+        );
+
+        // Disabled
+        $uacRaw = null;
+        if (isset($adUser['useraccountcontrol'][0]) === true) {
+            $uacRaw = $adUser['useraccountcontrol'][0];
+        } elseif (isset($adUser['userAccountControl'][0]) === true) {
+            $uacRaw = $adUser['userAccountControl'][0];
+        }
+        if ($uacRaw !== null && is_numeric($uacRaw)) {
+            $uac = (int) $uacRaw;
+            $tmp['ldapAccountDisabled'] = (($uac & 2) === 2) ? 1 : 0;
+        }
+
+        // Expired
+        $expiresRaw = null;
+        if (isset($adUser['accountexpires'][0]) === true) {
+            $expiresRaw = $adUser['accountexpires'][0];
+        } elseif (isset($adUser['accountExpires'][0]) === true) {
+            $expiresRaw = $adUser['accountExpires'][0];
+        }
+
+        if ($expiresRaw !== null) {
+            $expiresRawStr = trim((string) $expiresRaw);
+            if ($expiresRawStr !== '' &&
+                $expiresRawStr !== '0' &&
+                $expiresRawStr !== '9223372036854775807' &&
+                $expiresRawStr !== '18446744073709551615'
+            ) {
+                if (is_numeric($expiresRawStr)) {
+                    $filetime = (int) $expiresRawStr;
+                    if ($filetime > 0) {
+                        $unix = (int) (intdiv($filetime, 10000000) - 11644473600);
+                        $tmp['ldapAccountExpiresAt'] = $unix;
+                        $tmp['ldapAccountExpired'] = ($unix <= time()) ? 1 : 0;
+                    }
+                }
+            } else {
+                $tmp['ldapAccountExpired'] = 0;
+                $tmp['ldapAccountExpiresAt'] = null;
+            }
+        } elseif (isset($adUser['shadowexpire'][0]) === true && is_numeric($adUser['shadowexpire'][0])) {
+            $shadowDays = (int) $adUser['shadowexpire'][0];
+            if ($shadowDays > 0) {
+                $unix = $shadowDays * 86400;
+                $tmp['ldapAccountExpiresAt'] = $unix;
+                $tmp['ldapAccountExpired'] = ($unix <= time()) ? 1 : 0;
+            } else {
+                $tmp['ldapAccountExpired'] = 0;
+            }
+        }
+
+        $loginStatus[$userLogin] = $tmp;
+    }
+
+    // Map back to user ids
+    foreach ($idToLogin as $id => $login) {
+        if (isset($loginStatus[$login]) === true) {
+            $statuses[$id] = $loginStatus[$login];
+        } else {
+            // LDAP authenticated in Teampass but not found in LDAP directory
+            $statuses[$id]['ldapAccountMissing'] = 1;
+        }
+    }
+
+    return array(
+        'error' => false,
+        'statuses' => $statuses,
+    );
+}
+
+
+/**
+ * Purge deleted user by ID
+ * 
+ * @param int $userId
+ * @return array
+ */
+function purgeDeletedUserById(int $userId, bool $rebuildTree = true): array
+{
+    $session = SessionManager::getSession();
+    $lang = new Language($session->get('user-language') ?? 'english');
+    $treeChanged = false;
+    
+    // Vérifier que l'utilisateur est bien marqué deleted
+    $user = DB::queryFirstRow(
+        "SELECT id, login, deleted_at FROM " . prefixTable("users") . " 
+         WHERE id = %i 
+         AND deleted_at IS NOT NULL 
+         AND deleted_at > 0",
+        $userId
+    );
+    
+    if (!$user) {
+        return [
+            'error' => true,
+            'message' => $lang->get('user_not_found_or_not_deleted'),
+            'tree_changed' => false,
+        ];
+    }
+
+    DB::startTransaction();
+    
+    try {
+        // Delete private keys
+        DB::delete(
+            prefixTable('user_private_keys'),
+            'user_id = %i',
+            $userId
+        );       
+
+        // delete user api
+        DB::delete(
+            prefixTable('api'),
+            'user_id = %i',
+            $userId
+        );
+        
+        // Delete cache
+        DB::delete(
+            prefixTable('cache'),
+            'author = %i',
+            $userId
+        );
+        
+        // Delete cache_tree
+        DB::delete(
+            prefixTable('cache_tree'),
+            'user_id = %i',
+            $userId
+        );
+
+        // delete personal folder and subfolders
+        $data = DB::queryFirstRow(
+            'SELECT id FROM ' . prefixTable('nested_tree') . '
+            WHERE title = %s AND personal_folder = %i',
+            $userId,
+            '1'
+        );
+
+        // Delete tokens
+        DB::delete(
+            prefixTable('tokens'),
+            'user_id = %i',
+            $userId
+        );
+
+        // Get through each subfolder
+        if (!empty($data['id'])) {
+            $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+            $folders = $tree->getDescendants($data['id'], true);
+            foreach ($folders as $folder) {
+                // delete folder
+                DB::delete(prefixTable('nested_tree'), 'id = %i AND personal_folder = %i', $folder->id, '1');
+                // delete items & logs
+                $items = DB::query(
+                    'SELECT id FROM ' . prefixTable('items') . '
+                    WHERE id_tree=%i AND perso = %i',
+                    $folder->id,
+                    '1'
+                );
+                foreach ($items as $item) {
+                    // Delete item
+                    DB::delete(prefixTable('items'), 'id = %i', $item['id']);
+                    // log
+                    DB::delete(prefixTable('log_items'), 'id_item = %i', $item['id']);
+                }
+            }
+            $treeChanged = true;
+            if ($rebuildTree === true) {
+                // rebuild tree
+                $tree = new NestedTree(prefixTable('nested_tree'), 'id', 'parent_id', 'title');
+                $tree->rebuild();
+            }
+        }
+
+        // Delete objects keys
+        deleteUserObjetsKeys((int) $userId);
+        
+        // Delete user
+        DB::delete(
+            prefixTable('users'),
+            'id = %i',
+            $userId
+        );   
+
+        // Delete any process related to user
+        $processes = DB::query(
+            'SELECT increment_id
+            FROM ' . prefixTable('background_tasks') . '
+            WHERE JSON_EXTRACT(arguments, "$.new_user_id") = %i',
+            $userId
+        );
+        $process_id = -1;
+        foreach ($processes as $process) {
+            // Delete task
+            DB::delete(
+                prefixTable('background_subtasks'),
+                'task_id = %i',
+                $process['increment_id']
+            );
+            $process_id = $process['increment_id'];
+        }
+        // Delete main process
+        if ($process_id > -1) {
+            DB::delete(
+                prefixTable('background_tasks'),
+                'increment_id = %i',
+                $process_id
+            );
+        }
+
+        // Delete Roles
+        DB::delete(
+            prefixTable('users_roles'),
+            'user_id = %i',
+            $userId
+        );
+
+        // Delete Groups
+        DB::delete(
+            prefixTable('users_groups'),
+            'user_id = %i',
+            $userId
+        );
+        DB::delete(
+            prefixTable('users_groups_forbidden'),
+            'user_id = %i',
+            $userId
+        );
+
+        // Delete Latest items
+        DB::delete(
+            prefixTable('users_latest_items'),
+            'user_id = %i',
+            $userId
+        );
+
+        // Delete favorites
+        DB::delete(
+            prefixTable('users_favorites'),
+            'user_id = %i',
+            $userId
+        );
+        
+        // Log de la purge
+        logEvents(
+            $GLOBALS['SETTINGS'],
+            'user_mngt',
+            'user_purged',
+            (string) $session->get('user-id'),
+            $session->get('login'),
+            (string) $userId
+        );
+        
+        DB::commit();
+        
+        return [
+            'error' => false,
+            'message' => $lang->get('user_purged_successfully'),
+            'tree_changed' => $treeChanged,
+        ];
+        
+    } catch (Exception $e) {
+        DB::rollback();
+        return [
+            'error' => true,
+            'message' => $e->getMessage(),
+            'tree_changed' => $treeChanged,
+        ];
+    }
+}
+
+/**
+ * Purge old deleted users
+ * 
+ * @param int $daysRetention
+ * @return array
+ *//*
+function purgeOldDeletedUsers($daysRetention = 90): array
+{
+    $session = SessionManager::getSession();
+    $lang = new Language($session->get('user-language') ?? 'english');
+
+    $cutoffTimestamp = time() - ($daysRetention * 86400);
+    
+    // Récupérer les utilisateurs à purger
+    $usersToDelete = DB::query(
+        "SELECT id, login FROM " . prefixTable("users") . " 
+         WHERE deleted_at IS NOT NULL 
+         AND deleted_at > 0
+         AND deleted_at < %i",
+        $cutoffTimestamp
+    );
+    
+    $purgedCount = 0;
+    $errors = [];
+    
+    foreach ($usersToDelete as $user) {
+        $result = purgeDeletedUserById($user['id']);
+        
+        if ($result['error']) {
+            $errors[] = $user['login'] . ': ' . $result['message'];
+        } else {
+            $purgedCount++;
+        }
+    }
+    
+    return [
+        'error' => count($errors) > 0,
+        'purged_count' => $purgedCount,
+        'total_found' => count($usersToDelete),
+        'errors' => $errors,
+        'message' => $purgedCount . ' ' . $lang->get('users_purged_successfully')
+    ];
+}*/
+
+// evaluateFolderAccesLevel() is defined in main.functions.php (loaded via core.php)

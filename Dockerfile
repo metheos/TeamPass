@@ -11,8 +11,8 @@ WORKDIR /app
 COPY composer.json composer.lock ./
 
 # Copy local packages required by composer
-COPY includes/libraries/teampassclasses ./includes/libraries/teampassclasses
-COPY includes/libraries/ezimuel ./includes/libraries/ezimuel
+COPY app/includes/libraries/teampassclasses ./app/includes/libraries/teampassclasses
+COPY app/includes/libraries/ezimuel ./app/includes/libraries/ezimuel
 
 # Install production dependencies only
 RUN composer install \
@@ -34,7 +34,7 @@ LABEL maintainer="TeamPass <nils@teampass.net>" \
       org.opencontainers.image.description="Collaborative Passwords Manager" \
       org.opencontainers.image.url="https://teampass.net" \
       org.opencontainers.image.source="https://github.com/nilsteampassnet/TeamPass" \
-      org.opencontainers.image.documentation="https://teampass.readthedocs.io" \
+      org.opencontainers.image.documentation="https://documentation.teampass.net" \
       org.opencontainers.image.licenses="GPL-3.0" \
       org.opencontainers.image.vendor="TeamPass"
 
@@ -113,27 +113,34 @@ WORKDIR /var/www/html
 COPY --chown=nginx:nginx . .
 
 # Copy vendor from composer builder
-COPY --from=composer-builder --chown=nginx:nginx /app/vendor ./vendor
+COPY --from=composer-builder --chown=nginx:nginx /app/app/vendor ./app/vendor
 
 # Create required directories with proper permissions
 RUN mkdir -p \
-    sk \
-    files \
-    upload \
-    includes/libraries/csrfp/log \
+    storage/sk \
+    storage/files \
+    storage/upload \
+    storage/config \
+    storage/backups \
+    secrets \
+    app/includes/libraries/csrfp/log \
     /var/lib/nginx/tmp \
     /var/log/supervisor \
     /run/nginx \
     && chown -R nginx:nginx \
-        sk \
-        files \
-        upload \
-        includes/libraries/csrfp/log \
+        storage \
+        storage/sk \
+        storage/files \
+        storage/upload \
+        storage/config \
+        storage/backups \
+        secrets \
+        app/includes/libraries/csrfp/log \
         /var/lib/nginx \
         /var/log \
         /run/nginx \
-    && chmod 700 sk \
-    && chmod 750 files upload includes/libraries/csrfp/log
+    && chmod 700 storage/sk secrets \
+    && chmod 750 storage storage/files storage/upload storage/config storage/backups app/includes/libraries/csrfp/log
 
 # Remove unnecessary files for production
 RUN rm -rf \
@@ -149,7 +156,7 @@ RUN rm -rf \
     Dockerfile
 
 # Setup cron for TeamPass scheduler
-RUN echo "* * * * * php /var/www/html/sources/scheduler.php > /dev/null 2>&1" > /var/spool/cron/crontabs/nginx \
+RUN echo "* * * * * php /var/www/html/app/sources/scheduler.php > /dev/null 2>&1" > /var/spool/cron/crontabs/nginx \
     && chmod 600 /var/spool/cron/crontabs/nginx
 
 # Copy and set entrypoint script
@@ -163,8 +170,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # Expose HTTP port
 EXPOSE 80
 
-# Define volumes for persistent data
-VOLUME ["/var/www/html/sk", "/var/www/html/files", "/var/www/html/upload"]
+# Define volumes for persistent data.
+# storage/config holds the install state (settings.php, csrfp.config.php) and
+# secrets holds the Defuse master key: both must persist across container
+# recreation, otherwise TeamPass would try to reinstall itself (issue #5236).
+VOLUME ["/var/www/html/storage/sk", "/var/www/html/storage/files", "/var/www/html/storage/upload", "/var/www/html/storage/config", "/var/www/html/secrets"]
 
 # Set entrypoint and default command
 ENTRYPOINT ["/docker-entrypoint.sh"]

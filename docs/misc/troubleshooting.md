@@ -181,6 +181,30 @@ The account creation background task (key generation) may not have completed bef
 
 ---
 
+## MFA QR code does not appear / 2FA reset is refused
+
+### Symptom
+
+During Google Authenticator setup, no QR code is shown (not even a broken image), or the user
+gets the message *"Your administrator has disabled self-reset of the 2FA code…"* when trying to
+get a new code from the login page.
+
+### Cause / resolution
+
+- **No QR code** — the QR is generated **locally in the browser** from the `otpauth://` URI and
+  needs **no external service or internet access**. If nothing appears, do a hard refresh (the QR
+  library is served with a version query string and may be cached) and check the browser console
+  for JavaScript errors.
+- **"…disabled self-reset of the 2FA code…"** — the **User can reset his 2FA code** option
+  (`Settings → MFA`) is disabled, so users cannot reset their own code. Ask an administrator to
+  send a new code from the **Users** page (this always works), or enable the option.
+- **User enrolled but no working code** — an administrator must reset it from the **Users** page.
+
+See [Authentication → Multi Factor Authentication](../features/authentication.md) for the full
+enrollment flow.
+
+---
+
 ## Migrating TeamPass to another environment
 
 This section covers moving an existing TeamPass installation to a new server or from a test environment to production. **Never run the installer on an existing installation** — doing so regenerates the encryption key (SECUREFILE) and permanently invalidates all encrypted data.
@@ -188,8 +212,8 @@ This section covers moving an existing TeamPass installation to a new server or 
 ### Prerequisites
 
 Before starting, gather the following from the **source** server:
-- `includes/config/settings.php` (contains DB credentials, paths, and the SECUREFILE name)
-- The SECUREFILE itself (path and filename come from `settings.php` — the file is stored outside the web root at `SECUREPATH/SECUREFILE`)
+- `app/config/settings.php` (contains DB credentials and the SECUREFILE name)
+- The SECUREFILE itself (path and filename come from `settings.php` — the file is stored outside the web root at `TEAMPASS_SECRETS/SECUREFILE`)
 - A full database dump: `mysqldump -u <user> -p <dbname> > teampass_backup.sql`
 - The full TeamPass application folder
 
@@ -201,11 +225,14 @@ Transfer the entire TeamPass folder to the destination server. Preserve file per
 
 **2. Copy the SECUREFILE**
 
-The encryption master key is stored outside the web root. Find its location in `includes/config/settings.php`:
+The encryption master key is stored in the `secrets/` directory at the project root. Its filename is recorded in `app/config/settings.php`:
 
 ```php
-define('SECUREPATH', '/var/teampass/');   // example
-define('SECUREFILE', 'sk_xxxxxxxx');      // example
+// In app/config/settings.php (written by the installer):
+define('SECUREFILE', 'sk_xxxxxxxx');   // encryption key filename
+
+// TEAMPASS_SECRETS is auto-derived in app/config/include.php — do not edit:
+// define('TEAMPASS_SECRETS', TEAMPASS_ROOT . '/secrets');
 ```
 
 Copy that file to the **exact same path** on the destination server. If the path changes, update the constants in `settings.php`.
@@ -218,11 +245,11 @@ Copy that file to the **exact same path** on the destination server. If the path
 mysql -u <dest_user> -p <dest_dbname> < teampass_backup.sql
 ```
 
-**4. Update `includes/config/settings.php`**
+**4. Update `app/config/settings.php`**
 
 Edit the file on the destination server and update:
 - `DB_HOST`, `DB_USER`, `DB_PASSWD`, `DB_BDDNAME` — destination DB credentials
-- `SECUREPATH` / `SECUREFILE` — only if the path changed in step 2
+- `TEAMPASS_SECRETS` / `SECUREFILE` — only if the path changed in step 2
 
 **5. Update paths in the database**
 
