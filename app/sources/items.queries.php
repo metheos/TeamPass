@@ -8276,66 +8276,10 @@ switch ($inputData['type']) {
         $successfulDeletions = array();
         $failedDeletions = array();
 
+        // Accumulate per-folder counter deltas, applied once after the loop (#5221)
+        $folderCounterDeltas = [];
+
         foreach ($selectedItemIds as $itemId) {
-            // Check that user can access this item
-            $granted = accessToItemIsGranted((int) $itemId, $SETTINGS);
-            if ($granted !== true) {
-                $failedDeletions[$itemId] = $granted;
-                continue; // Passer à l'item suivant
-            }
-
-            // Load item data
-            $data = DB::queryFirstRow(
-                'SELECT id_tree, id, label
-                    FROM ' . prefixTable('items') . '
-                    WHERE id = %i',
-                $itemId
-            );
-            if ($data === null) {
-                $failedDeletions[$itemId] = $lang->get('error_item_not_found');
-                continue; // Passer à l'item suivant
-            }
-            $itemLabel = $data['label'];
-            $itemTreeId = intval($data['id_tree']);
-
-            // Check that user can delete on this folder
-            $checkRights = getCurrentAccessRights(
-                $session->get('user-id'),
-                (int) $itemId,
-                $itemTreeId,
-            );
-
-            if ($checkRights['error'] || !$checkRights['delete']) {
-                echo (string) prepareExchangedData(
-                    array(
-                        'error' => true,
-                        'message' => $lang->get('error_readonly_account'),
-                    ),
-                    'encode'
-                );
-            }
-
-            // decrypt and retrieve data in JSON format
-            $dataReceived = prepareExchangedData(
-                $inputData['data'],
-                'decode'
-            );
-            
-            // Prepare POST variables
-            $selectedItemIdsJson = $dataReceived['selectedItemIds'] ?? '[]';
-            $selectedItemIds = json_decode($selectedItemIdsJson, true) ?: array();
-            $selectedItemIds = array_map(function($id) {
-                return filter_var($id, FILTER_SANITIZE_FULL_SPECIAL_CHARS);
-            }, $selectedItemIds);
-
-            // Initialiser les variables de gestion d'erreurs
-            $successfulDeletions = array();
-            $failedDeletions = array();
-
-            // Accumulate per-folder counter deltas, applied once after the loop (#5221)
-            $folderCounterDeltas = [];
-
-            foreach( $selectedItemIds as $itemId) {
                 // Check that user can access this item
                 $granted = accessToItemIsGranted((int) $itemId, $SETTINGS);
                 if ($granted !== true) {
@@ -8414,17 +8358,12 @@ switch ($inputData['type']) {
                 'message' => !empty($failedDeletions) ? $lang->get('some_items_failed_to_delete') : $lang->get('all_items_deleted_successfully')
             );
 
-            // log
-            logItems(
-                $SETTINGS,
-                (int) $itemId,
-                $itemLabel,
-                $session->get('user-id'),
-                'at_delete',
-                $session->get('user-login')
-            );
+        echo (string) prepareExchangedData(
+            $response,
+            'encode'
+        );
 
-            break;
+        break;
 
         /*
         * CASE

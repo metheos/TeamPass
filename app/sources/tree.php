@@ -270,6 +270,7 @@ if ($goTreeRefresh['state'] === true || empty($inputData['nodeId']) === false) {
         'version' => $treeVersion,
         'source' => 'cache_tree',
     ]);
+    $filteredTree = filterTreeNodesBySearch(json_decode($cachedData, true) ?? [], $searchTerm);
     if (!empty($inputData['treeVersion']) && $inputData['treeVersion'] === $treeVersion) {
         $sendTreeTimingHeader($treeRequestStartedAt, 'cached-unchanged');
         echo json_encode(['unchanged' => true, 'version' => $treeVersion]);
