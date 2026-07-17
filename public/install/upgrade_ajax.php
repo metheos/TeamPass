@@ -240,6 +240,11 @@ $getUpgradeSessionValue = static function (string $key) use ($superGlobal, $sess
     return $value ?? $superGlobal->get($key, 'SESSION');
 };
 
+$clearUpgradeSessionValue = static function (string $key) use ($session): void {
+    unset($_SESSION[$key]);
+    $session->remove($key);
+};
+
 
 // Test DB connexion
 $pass = defuse_return_decrypted(DB_PASSWD);
@@ -274,8 +279,8 @@ $_SESSION['settings']['loaded'] = '';
 if (empty($post_fullurl) === false) {
     $setUpgradeSessionValue('fullurl', $post_fullurl);
 }
-if (empty($abspath) === false) {
-    $setUpgradeSessionValue('abspath', $abspath);
+if (empty($post_abspath) === false) {
+    $setUpgradeSessionValue('abspath', $post_abspath);
 }
 
 // Get Sessions
@@ -284,9 +289,13 @@ $session_url_path = $getUpgradeSessionValue('url_path');
 if (isset($post_type)) {
     switch ($post_type) {
         case 'step0':
-            // Reset the current upgrade session contents but keep the encrypted
-            // PHP session alive so subsequent AJAX steps can read the values set below.
-            $_SESSION = array();
+            // Clear only the upgrade workflow keys. Replacing the entire $_SESSION
+            // array after SessionManager has started can break persistence of the
+            // encrypted Symfony session between AJAX steps.
+            foreach (['user_granted', 'user_login', 'user_password', 'user_id', 'fullurl', 'abspath', 'utf8_enabled', 'url_path'] as $upgradeSessionKey) {
+                $clearUpgradeSessionValue($upgradeSessionKey);
+            }
+            unset($_SESSION['settings']);
             setcookie('pma_end_session');
 
             require_once './libs/aesctr.php';
