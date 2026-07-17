@@ -34,9 +34,6 @@ use TeampassClasses\PasswordManager\PasswordManager;
 use TeampassClasses\ConfigManager\ConfigManager;
 use TeampassClasses\SessionManager\SessionManager;
 
-
-$_SESSION = [];
-
 function settingsConsistencyCheck(): array
 {
     $settingsFile = __DIR__.'/../../app/config/settings.php';
@@ -200,7 +197,7 @@ loadClasses('DB');
 // Resume the encrypted session opened by upgrade.php.
 // SessionManager registers the EncryptedSessionProxy handler; a bare session_start()
 // would read unintelligible encrypted bytes and return an empty $_SESSION.
-SessionManager::getSession();
+$session = SessionManager::getSession();
 $superGlobal = new SuperGlobal();
 $lang = new Language();
 
@@ -231,6 +228,17 @@ $post_no_maintenance_mode = filter_input(INPUT_POST, 'no_maintenance_mode', FILT
 $post_prefix_before_convert = filter_input(INPUT_POST, 'prefix_before_convert', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
 $post_sk_path = filter_input(INPUT_POST, 'sk_path', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
 $post_url_path = filter_input(INPUT_POST, 'url_path', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+
+$setUpgradeSessionValue = static function (string $key, $value) use ($superGlobal, $session): void {
+    $superGlobal->put($key, $value, 'SESSION');
+    $session->set($key, $value);
+};
+
+$getUpgradeSessionValue = static function (string $key) use ($superGlobal, $session) {
+    $value = $session->get($key);
+
+    return $value ?? $superGlobal->get($key, 'SESSION');
+};
 
 
 // Test DB connexion
@@ -264,14 +272,14 @@ $superGlobal->put('CPM', 1, 'SESSION');
 $superGlobal->put('db_encoding', 'utf8', 'SESSION');
 $_SESSION['settings']['loaded'] = '';
 if (empty($post_fullurl) === false) {
-    $superGlobal->put('fullurl', $post_fullurl, 'SESSION');
+    $setUpgradeSessionValue('fullurl', $post_fullurl);
 }
 if (empty($abspath) === false) {
-    $superGlobal->put('abspath', $abspath, 'SESSION');
+    $setUpgradeSessionValue('abspath', $abspath);
 }
 
 // Get Sessions
-$session_url_path = $superGlobal->get('url_path', 'SESSION');
+$session_url_path = $getUpgradeSessionValue('url_path');
 
 if (isset($post_type)) {
     switch ($post_type) {
@@ -317,13 +325,13 @@ if (isset($post_type)) {
                     '"error" : "User is not allowed",'.
                     '"index" : ""'.
                 '}]';
-                $superGlobal->put('user_granted', false, 'SESSION');
+                $setUpgradeSessionValue('user_granted', false);
             } else {
                 if ($passwordManager->verifyPassword($user_info['pw'], Encryption\Crypt\aesctr::decrypt(base64_decode($post_pwd), 'cpm', 128)) === true && $user_info['admin'] === '1') {
-                    $superGlobal->put('user_granted', true, 'SESSION');
-                    $superGlobal->put('user_login', mysqli_escape_string($db_link, stripslashes($post_login)), 'SESSION');
-                    $superGlobal->put('user_password', Encryption\Crypt\aesctr::decrypt(base64_decode($post_pwd), 'cpm', 128), 'SESSION');
-                    $superGlobal->put('user_id', $user_info['id'], 'SESSION');
+                    $setUpgradeSessionValue('user_granted', true);
+                    $setUpgradeSessionValue('user_login', mysqli_escape_string($db_link, stripslashes($post_login)));
+                    $setUpgradeSessionValue('user_password', Encryption\Crypt\aesctr::decrypt(base64_decode($post_pwd), 'cpm', 128));
+                    $setUpgradeSessionValue('user_id', $user_info['id']);
                     echo '[{'.
                         '"error" : "",'.
                         '"index" : 1,'.
@@ -332,7 +340,7 @@ if (isset($post_type)) {
                         )) . '"'.
                     '}]';
                 } else {
-                    $superGlobal->put('user_granted', false, 'SESSION');
+                    $setUpgradeSessionValue('user_granted', false);
                     echo '[{'.
                         '"error" : "User is not allowed",'.
                         '"index" : ""'.
@@ -343,7 +351,7 @@ if (isset($post_type)) {
             break;
 
         case 'step1':
-            $session_user_granted = $superGlobal->get('user_granted', 'SESSION');
+            $session_user_granted = $getUpgradeSessionValue('user_granted');
 
             if (intval($session_user_granted) !== 1) {
                 echo '[{'.
@@ -575,7 +583,7 @@ if (isset($post_type)) {
             //==========================
         case 'step2':
             $res = '';
-            $session_user_granted = $superGlobal->get('user_granted', 'SESSION');
+            $session_user_granted = $getUpgradeSessionValue('user_granted');
 
             if (intval($session_user_granted) !== 1) {
                 echo '[{'.
@@ -605,7 +613,7 @@ if (isset($post_type)) {
                     )
                 );
             }
-            $superGlobal->put('utf8_enabled', $cpmIsUTF8[0], 'SESSION');
+            $setUpgradeSessionValue('utf8_enabled', $cpmIsUTF8[0]);
 
             // put TP in maintenance mode or not
             @mysqli_query(
@@ -625,7 +633,7 @@ if (isset($post_type)) {
 
             //==========================
         case 'step3':
-            $session_user_granted = $superGlobal->get('user_granted', 'SESSION');
+            $session_user_granted = $getUpgradeSessionValue('user_granted');
 
             if (intval($session_user_granted) !== 1) {
                 echo '[{'.
@@ -682,7 +690,7 @@ if (isset($post_type)) {
 
             //=============================
         case 'step5':
-            $session_user_granted = $superGlobal->get('user_granted', 'SESSION');
+            $session_user_granted = $getUpgradeSessionValue('user_granted');
 
             if (intVal($session_user_granted) !== 1) {
                 echo '[{'.
