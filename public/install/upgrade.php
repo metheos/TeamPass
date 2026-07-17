@@ -50,6 +50,19 @@ require_once '../sources/main.functions.php';
 loadClasses();
 $session = SessionManager::getSession();
 
+$setUpgradeSessionValue = static function (string $key, $value) use ($session): void {
+    $_SESSION[$key] = $value;
+    $session->set($key, $value);
+};
+
+$getUpgradeSessionValue = static function (string $key) use ($session) {
+    $value = $session->get($key);
+
+    return $value ?? ($_SESSION[$key] ?? null);
+};
+
+$sessionUserGranted = (string) ($getUpgradeSessionValue('user_granted') ?? '');
+
 // Prepare POST variables
 $post_root_url = filter_input(INPUT_POST, 'root_url', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
 $post_step = filter_input(INPUT_POST, 'step', FILTER_SANITIZE_NUMBER_INT);
@@ -147,7 +160,7 @@ require_once TEAMPASS_ROOT . '/app/includes/language/english.php';
 require_once TEAMPASS_ROOT . '/app/config/include.php';
 
 if (empty($post_root_url) === false) {
-    $_SESSION['fullurl'] = $post_root_url;
+    $setUpgradeSessionValue('fullurl', $post_root_url);
 }
 
 // In the new public/app/storage structure, DOCUMENT_ROOT points to public/ not the app root.
@@ -280,7 +293,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
     && $post_user_granted === '1'
 ) {
     //ETAPE 1
-    $_SESSION['user_granted'] = $post_user_granted;
+    $setUpgradeSessionValue('user_granted', $post_user_granted);
     echo '
             <div class="row">
                 <div class="col-12">
@@ -477,7 +490,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 // STEP2
 } elseif ((isset($post_step) && $post_step == 2)
     || (isset($_GET['step']) && $_GET['step'] == 2)
-    && $_SESSION['user_granted'] === '1'
+    && $sessionUserGranted === '1'
 ) {
     // Do we have all database settings
     if (defined('DB_HOST')
@@ -603,7 +616,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
                             <p>Please use the next field to enter the saltkey you used in previous version of Teampass. It can be retrieved by editing sk.php file (in case you are upgrading from a version older than 2.1.27) or a sk.php backup file (in case you are upgrading from 2.1.27).<br>
                             </p>
                             <label for="previous_sk">Previous SaltKey:&nbsp</label>
-                            <input type="text" id="previous_sk" size="100px" value="'.@$_SESSION['encrypt_key'].'" />
+                            <input type="text" id="previous_sk" size="100px" value="'.htmlspecialchars((string) ($getUpgradeSessionValue('encrypt_key') ?? ''), ENT_QUOTES, 'UTF-8').'" />
                         </div>
                         </div>
                     </div>
@@ -619,7 +632,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 // STEP3
 } elseif ((isset($post_step) && $post_step == 3 || isset($_GET['step']) && $_GET['step'] == 3)
     && isset($post_actual_cpm_version)
-    && intVal($_SESSION['user_granted']) === 1
+    && (int) $sessionUserGranted === 1
 ) {
     if (version_compare($post_actual_cpm_version, '2.1.26', '<')) {
         $conversion_utf8 = true;
@@ -646,7 +659,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 // STEP4
 } elseif ((isset($post_step) && $post_step == 4) || (isset($_GET['step'])
     && $_GET['step'] == 4)
-    && $_SESSION['user_granted'] === '1'
+    && $sessionUserGranted === '1'
 ) {
     echo '
         <div class="card card-primary">
@@ -691,7 +704,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 // STEP5
 } elseif ((isset($post_step) && $post_step == 5)
     || (isset($_GET['step']) && $_GET['step'] == 5)
-    && $_SESSION['user_granted'] === '1'
+    && $sessionUserGranted === '1'
 ) {
     //STEP 5
     echo '
@@ -721,7 +734,7 @@ if (!isset($_GET['step']) && !isset($post_step)) {
         <div class="alert alert-info mt-4 hidden" id="res_step5"></div>';
 } elseif ((isset($post_step) && $post_step == 6)
     || (isset($_GET['step']) && $_GET['step'] == 6)
-    && $_SESSION['user_granted'] === '1'
+    && $sessionUserGranted === '1'
 ) {
     // STEP 6
     $homeUrl = ((isset($_SERVER['HTTPS']) && ($_SERVER['HTTPS'] == 'on' || $_SERVER['HTTPS'] == 1) || isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') ? 'https' : 'http').'://'.$_SERVER['HTTP_HOST'].substr($_SERVER['PHP_SELF'], 0, strrpos($_SERVER['PHP_SELF'], '/') - 8).'/index.php';
@@ -815,14 +828,14 @@ if (!isset($post_step)) {
     echo '
             <input type="button" id="but_launch" data-step="step0" class="btn btn-primary" value="START">
             <input type="button" id="but_next" data-target="1" style="" class="btn btn-primary" value="NEXT" disabled="disabled">';
-} elseif (intVal($post_step) === 3 && $conversion_utf8 === false && ($_SESSION['user_granted'] ?? null) === '1') {
+} elseif (intVal($post_step) === 3 && $conversion_utf8 === false && $sessionUserGranted === '1') {
     echo '
             <input type="button" id="but_next" target_id="'.(intval($post_step) + 1).'" class="btn btn-primary" value="NEXT">';
-} elseif (intVal($post_step) === 3 && $conversion_utf8 === true && ($_SESSION['user_granted'] ?? null) === '1') {
+} elseif (intVal($post_step) === 3 && $conversion_utf8 === true && $sessionUserGranted === '1') {
     echo '
             <input type="button" id="but_launch" data-step="step'.$post_step.'" class="btn btn-primary" value="START">
             <input type="button" id="but_next" data-target="'.(intval($post_step) + 1).'" class="btn btn-primary" value="NEXT" disabled="disabled">';
-} elseif (intVal($post_step) === 6 && ($_SESSION['user_granted'] ?? null) === '1') {
+} elseif (intVal($post_step) === 6 && $sessionUserGranted === '1') {
     // Nothong to do
 } else {
     echo '
