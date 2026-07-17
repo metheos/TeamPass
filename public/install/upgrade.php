@@ -288,8 +288,8 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 
             </div>';
 // STEP1
-} elseif ((isset($post_step) && $post_step == 1)
-    || (isset($_GET['step']) && $_GET['step'] == 1)
+} elseif (((isset($post_step) && $post_step == 1)
+    || (isset($_GET['step']) && $_GET['step'] == 1))
     && $post_user_granted === '1'
 ) {
     //ETAPE 1
@@ -488,8 +488,8 @@ if (!isset($_GET['step']) && !isset($post_step)) {
             </div>
             <input type="hidden" id="step1" name="step1" value="" />';
 // STEP2
-} elseif ((isset($post_step) && $post_step == 2)
-    || (isset($_GET['step']) && $_GET['step'] == 2)
+} elseif (((isset($post_step) && $post_step == 2)
+    || (isset($_GET['step']) && $_GET['step'] == 2))
     && $sessionUserGranted === '1'
 ) {
     // Do we have all database settings
@@ -630,7 +630,8 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 
 
 // STEP3
-} elseif ((isset($post_step) && $post_step == 3 || isset($_GET['step']) && $_GET['step'] == 3)
+} elseif (((isset($post_step) && $post_step == 3)
+    || (isset($_GET['step']) && $_GET['step'] == 3))
     && isset($post_actual_cpm_version)
     && (int) $sessionUserGranted === 1
 ) {
@@ -657,8 +658,8 @@ if (!isset($_GET['step']) && !isset($post_step)) {
             </div>
         </div>';
 // STEP4
-} elseif ((isset($post_step) && $post_step == 4) || (isset($_GET['step'])
-    && $_GET['step'] == 4)
+} elseif (((isset($post_step) && $post_step == 4)
+    || (isset($_GET['step']) && $_GET['step'] == 4))
     && $sessionUserGranted === '1'
 ) {
     echo '
@@ -702,8 +703,8 @@ if (!isset($_GET['step']) && !isset($post_step)) {
             </div>
         </div>';
 // STEP5
-} elseif ((isset($post_step) && $post_step == 5)
-    || (isset($_GET['step']) && $_GET['step'] == 5)
+} elseif (((isset($post_step) && $post_step == 5)
+    || (isset($_GET['step']) && $_GET['step'] == 5))
     && $sessionUserGranted === '1'
 ) {
     //STEP 5
@@ -732,8 +733,8 @@ if (!isset($_GET['step']) && !isset($post_step)) {
 
     echo '
         <div class="alert alert-info mt-4 hidden" id="res_step5"></div>';
-} elseif ((isset($post_step) && $post_step == 6)
-    || (isset($_GET['step']) && $_GET['step'] == 6)
+} elseif (((isset($post_step) && $post_step == 6)
+    || (isset($_GET['step']) && $_GET['step'] == 6))
     && $sessionUserGranted === '1'
 ) {
     // STEP 6
