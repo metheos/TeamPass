@@ -291,6 +291,60 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
         })
     }
 
+    const descriptionEditorToolbar = [
+        ['style', ['style']],
+        ['font', ['bold', 'italic', 'underline', 'strikethrough', 'clear']],
+        ['fontsize', ['fontsize']],
+        ['color', ['color']],
+        ['para', ['ul', 'ol', 'paragraph']],
+        ['insert', ['link', 'picture']],
+        ['view', ['codeview']]
+    ]
+
+    let isFormPasswordVisible = false
+
+    function isMobileViewport() {
+        return window.matchMedia('(max-width: 767.98px)').matches
+    }
+
+    function setFormPasswordVisibility(shouldShow) {
+        isFormPasswordVisible = shouldShow === true
+        $('#form-item-password').attr('type', isFormPasswordVisible ? 'text' : 'password')
+
+        const $icon = $('#item-button-password-show').find('i')
+        if (isFormPasswordVisible) {
+            $icon.removeClass('fa-low-vision').addClass('fa-eye-slash text-warning')
+        } else {
+            $icon.removeClass('fa-eye-slash text-warning').addClass('fa-low-vision')
+        }
+    }
+
+    function initDescriptionEditor(selector, onChangeCallback = null) {
+        const mobileView = isMobileViewport()
+        const callbacks = {}
+
+        callbacks.onPaste = function(e) {
+            if (mobileView === true) {
+                e.preventDefault()
+                const pastedText = ((e.originalEvent || e).clipboardData || window.clipboardData).getData('text/plain')
+                document.execCommand('insertText', false, pastedText)
+            }
+        }
+
+        if (typeof onChangeCallback === 'function') {
+            callbacks.onChange = onChangeCallback
+        }
+
+        $(selector).summernote({
+            toolbar: mobileView === true ? [] : descriptionEditorToolbar,
+            codeviewFilter: true,
+            codeviewIframeFilter: true,
+            disableDragAndDrop: true,
+            shortcuts: mobileView === false,
+            callbacks: callbacks,
+        })
+    }
+
     /**
      * Start edition lock heartbeat via AJAX.
      * Sends a renew_lock request every 60 seconds to keep the lock alive.
