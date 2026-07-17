@@ -663,16 +663,20 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
             toastr.remove()
         })
 
-        // Guard against refresh failure if tree is not initialized or search returns no results
+        // Attempt tree refresh; if it fails, manually trigger the refresh event
+        // so the one() listener above still executes and search can proceed
         try {
             const jstreeInstance = $('#jstree').jstree(true)
-            if (jstreeInstance && jstreeInstance.get_container_ul() && jstreeInstance.get_container_ul()[0]) {
+            if (jstreeInstance) {
                 jstreeInstance.refresh(true)
+            } else {
+                // Tree not initialized; fire the event manually
+                $('#jstree').trigger('refresh.jstree')
             }
         } catch (e) {
             if (debugJavascript === true) console.error('jstree refresh failed during folder search:', e)
-            toastr.remove()
-            toastr.warning('Search completed but tree refresh had an issue. Please refresh the page.')
+            // Still fire the event so search flow continues
+            $('#jstree').trigger('refresh.jstree')
         }
     })
 
