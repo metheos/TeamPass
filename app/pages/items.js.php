@@ -663,7 +663,17 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
             toastr.remove()
         })
 
-        $('#jstree').jstree(true).refresh(true)
+        // Guard against refresh failure if tree is not initialized or search returns no results
+        try {
+            const jstreeInstance = $('#jstree').jstree(true)
+            if (jstreeInstance && jstreeInstance.get_container_ul() && jstreeInstance.get_container_ul()[0]) {
+                jstreeInstance.refresh(true)
+            }
+        } catch (e) {
+            if (debugJavascript === true) console.error('jstree refresh failed during folder search:', e)
+            toastr.remove()
+            toastr.warning('Search completed but tree refresh had an issue. Please refresh the page.')
+        }
     })
 
     // Is this a short url
