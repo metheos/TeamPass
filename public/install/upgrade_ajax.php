@@ -276,10 +276,10 @@ $session_url_path = $superGlobal->get('url_path', 'SESSION');
 if (isset($post_type)) {
     switch ($post_type) {
         case 'step0':
-            // erase session table
+            // Reset the current upgrade session contents but keep the encrypted
+            // PHP session alive so subsequent AJAX steps can read the values set below.
             $_SESSION = array();
             setcookie('pma_end_session');
-            session_destroy();
 
             require_once './libs/aesctr.php';
             
@@ -577,7 +577,7 @@ if (isset($post_type)) {
             $res = '';
             $session_user_granted = $superGlobal->get('user_granted', 'SESSION');
 
-            if ($session_user_granted !== '1') {
+            if (intval($session_user_granted) !== 1) {
                 echo '[{'.
                     '"error" : "User not connected anymore",'.
                     '"index" : ""'.
@@ -627,7 +627,7 @@ if (isset($post_type)) {
         case 'step3':
             $session_user_granted = $superGlobal->get('user_granted', 'SESSION');
 
-            if ($session_user_granted !== '1') {
+            if (intval($session_user_granted) !== 1) {
                 echo '[{'.
                     '"error" : "User not connected anymore",'.
                     '"index" : ""'.
