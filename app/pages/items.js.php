@@ -651,9 +651,6 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
         toastr.remove()
         toastr.info('<?php echo $lang->get('searching'); ?>')
 
-        // Clear any stale error messages from previous searches
-        $('#jstree').empty()
-
         // Attempt tree refresh
         try {
             const jstreeInstance = $('#jstree').jstree(true)
@@ -4961,9 +4958,13 @@ $bip39Wordlist = loadBip39Wordlist($session->get('user-language') ?? 'english');
                         disabled = '';
 
                     if (typeof data.html_json === 'undefined' || typeof data.html_json.folders === 'undefined') {
-                        $('#jstree').html('<div class="alert alert-warning mt-3 mr-1 ml-1"><i class="fa-solid fa-exclamation-triangle mr-2"></i>' +
-                            '<?php echo $lang->get('no_data_to_display'); ?>' +
-                            '</div>');
+                        // Only show error in tree if NOT in search mode
+                        // During search, an empty result is expected and jstree handles displaying filtered nodes
+                        if (activeFolderSearchTerm.length < 6) {
+                            $('#jstree').html('<div class="alert alert-warning mt-3 mr-1 ml-1"><i class="fa-solid fa-exclamation-triangle mr-2"></i>' +
+                                '<?php echo $lang->get('no_data_to_display'); ?>' +
+                                '</div>');
+                        }
                     } else {
                         refreshFoldersInfo(data.html_json.folders, 'clear');
 
